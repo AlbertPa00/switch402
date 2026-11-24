@@ -16,6 +16,9 @@ Long-term userbase growth ops log. Update the status column as items land.
 | Official MCP Registry | ✅ LIVE | `dev.fly.switch402/switch402` v0.1.3 published via HTTP (Ed25519) auth, remotes → `switch402.fly.dev/mcp`. Auto-feeds PulseMCP + Glama. |
 | Official MCP Registry (canonical) | ⏳ pending npm | `io.github.AlbertPa00/switch402-mcp` at 0.1.1 — republish 0.1.3 after `npm publish` (see below) |
 | awesome-mcp-servers | ⏳ PR open | https://github.com/punkpeye/awesome-mcp-servers/pull/20632 — Aggregators section, Glama badge in README |
+| xpaysh/awesome-x402 | ⏳ PR open | https://github.com/xpaysh/awesome-x402/pull/2354 — Ecosystem Projects |
+| Merit awesome-agentic-commerce | ⏳ PR open | https://github.com/Merit-Systems/awesome-agentic-commerce/pull/920 — Ecosystem section |
+| gold-402 directory | ⏳ PR open | https://github.com/Haustorium12/gold-402/pull/530 — directory/apis.md, they probe the 402 before merge |
 | npm `switch402-mcp` | ⏳ 0.1.3 not published | `npm publish` needs user OTP (2FA) — run in `packages/mcp` |
 | mcp.so | 🔲 manual | https://mcp.so/submit — repo URL `AlbertPa00/switch402`; free review or $39 instant+featured |
 | PulseMCP | ⏸ paused | Submissions paused since 2026-09; auto-picks from official registry when back — registry listing covers us |
