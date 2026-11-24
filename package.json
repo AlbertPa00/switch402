@@ -1,0 +1,19 @@
+{
+  "name": "switch402-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Switch402 — Stateless Agent Inference & Action Switch (OpenAI API + Meta-MCP + x402 + Outbound WS Workers)",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "start": "node packages/server/index.mjs",
+    "worker": "node packages/cli/bin.mjs",
+    "mcp": "node packages/mcp/mcp-server.mjs",
+    "test": "node --test test/e2e.test.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

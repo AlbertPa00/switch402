@@ -1,0 +1,32 @@
+{
+  "name": "switch402",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Switch402 CLI & Outbound WebSocket Seller Daemon — sell idle GPU inference or JSON skills (keep 95%) and call the Switch402 agent grid via x402 or Lightning",
+  "keywords": [
+    "x402",
+    "ai-agents",
+    "mcp",
+    "inference",
+    "openai-compatible",
+    "ollama",
+    "vllm",
+    "lightning",
+    "usdc",
+    "agent-economy"
+  ],
+  "bin": {
+    "switch402": "./bin.mjs"
+  },
+  "main": "./worker.mjs",
+  "files": [
+    "bin.mjs",
+    "worker.mjs",
+    "lib.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

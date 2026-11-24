@@ -1,0 +1,13 @@
+services:
+  switch402:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "4020:4020"
+    volumes:
+      - switch402_data:/app/data
+
+volumes:
+  switch402_data:

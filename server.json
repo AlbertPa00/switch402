@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+  "name": "io.github.GITHUB_USER/switch402-mcp",
+  "description": "Switch402 Universal Auto-Discovery & Execution MCP Server — instant access to P2P inference & x402 capabilities",
+  "version": "0.1.0",
+  "title": "Switch402",
+  "websiteUrl": "https://switch402.fly.dev",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "switch402-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "SWITCH402_URL",
+          "description": "Switch402 grid server base URL",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "default": "https://switch402.fly.dev"
+        }
+      ]
+    }
+  ]
+}

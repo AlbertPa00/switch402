@@ -1,0 +1,18 @@
+# Smithery configuration for switch402-mcp
+startCommand:
+  type: stdio
+  commandFunction: |-
+    (config) => ({
+      command: 'npx',
+      args: ['-y', 'switch402-mcp', '--server', config.serverUrl || 'https://switch402.fly.dev'],
+      env: {}
+    })
+  configSchema:
+    type: object
+    properties:
+      serverUrl:
+        type: string
+        title: Switch402 Server URL
+        description: Base URL of the Switch402 grid server
+        default: https://switch402.fly.dev
+    required: []

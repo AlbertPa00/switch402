@@ -1,0 +1,12 @@
+{
+  "name": "@switch402/protocol",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./nano": "./nano.mjs",
+    "./crypto": "./crypto.mjs",
+    "./ws": "./ws.mjs"
+  }
+}

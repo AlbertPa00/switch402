@@ -1,0 +1,30 @@
+{
+  "name": "switch402-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Switch402 Universal Auto-Discovery & Execution MCP Server — gives Claude Code, Cursor, Antigravity, and Codex instant access to P2P inference & x402 capabilities",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "x402",
+    "ai-agents",
+    "inference",
+    "openai",
+    "claude",
+    "cursor",
+    "antigravity"
+  ],
+  "bin": {
+    "switch402-mcp": "./mcp-server.mjs"
+  },
+  "main": "./mcp-server.mjs",
+  "files": [
+    "mcp-server.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

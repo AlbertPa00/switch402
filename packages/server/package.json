@@ -1,0 +1,6 @@
+{
+  "name": "@switch402/server",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./index.mjs"
+}
