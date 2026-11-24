@@ -283,6 +283,7 @@ test('3. Multi-rail payments: x402 v2 keyless call, replay block, Lightning HMAC
       }
       return { isValid: false, invalidReason: 'bad signature' }
     },
+    customPayoutExecutor: async () => ({ txId: 'ln_mock_tx_1' }),
   })
   const { url } = await app.listen(0)
 
@@ -481,7 +482,7 @@ test('4. Meta-MCP stdio server full JSON-RPC handshake & live capability executi
 
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`)
     const listRes = await waitForId(2)
-    assert.equal(listRes.result.tools.length, 5)
+    assert.equal(listRes.result.tools.length, 7)
 
     child.stdin.write(
       `${JSON.stringify({
@@ -741,6 +742,98 @@ test('6. Adversarial security regressions: token-inflation cap, SSRF block, unco
   } finally {
     await app.close()
     fs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
+test('7. Zero-friction onboarding & hardening: 10 free sandbox calls, fail-closed withdraw, remote /mcp, leaderboard & agent-card', async () => {
+  const app = createSwitchServer({ heartbeatEnabled: false })
+  const { url } = await app.listen(0)
+
+  try {
+    // 7A. Freshly registered agent with $0.00 gets 10 free sandbox calls on switch402/instant-test
+    const reg = (await postJson(`${url}/v1/agents/register`, { name: 'zero-bal-agent' })).body
+    assert.equal(reg.sandboxCallsRemaining, 10)
+
+    for (let i = 1; i <= 9; i++) {
+      const r = await postJson(
+        `${url}/v1/chat/completions`,
+        { model: 'switch402/instant-test', messages: [{ role: 'user', content: `ping ${i}` }] },
+        { Authorization: `Bearer ${reg.apiKey}` }
+      )
+      assert.equal(r.status, 200)
+      assert.equal(r.headers['x-switch402-mode'], 'sandbox_free')
+      assert.equal(r.headers['x-switch402-cost-usd'], '0.000000')
+      assert.equal(r.headers['x-switch402-sandbox-remaining'], String(10 - i))
+    }
+
+    // 10th call via SSE streaming also succeeds free
+    const sse10 = await fetch(`${url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${reg.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'switch402/instant-test',
+        stream: true,
+        messages: [{ role: 'user', content: 'final free stream' }],
+      }),
+    })
+    assert.equal(sse10.status, 200)
+    const sseText = await sse10.text()
+    assert.match(sseText, /mode=sandbox_free/)
+    assert.match(sseText, /sandbox_remaining=0/)
+
+    // 11th call MUST hit HTTP 402 Payment Required
+    const call11 = await postJson(
+      `${url}/v1/chat/completions`,
+      { model: 'switch402/instant-test', messages: [{ role: 'user', content: 'over quota' }] },
+      { Authorization: `Bearer ${reg.apiKey}` }
+    )
+    assert.equal(call11.status, 402)
+
+    // 7B. Fail-closed withdrawal when no payout rail is configured (must NOT burn funds!)
+    app.ledger.deposit({ agentId: reg.agentId, amountNano: usdToNano('5.00'), txId: 'dep-fc-5' })
+    const failWd = await postJson(
+      `${url}/v1/wallet/withdraw`,
+      { amountUsd: '2.00', rail: 'evm_usdc', destination: '0x1234567890abcdef1234567890abcdef12345678' },
+      { Authorization: `Bearer ${reg.apiKey}` }
+    )
+    assert.equal(failWd.status, 400)
+    assert.match(failWd.body.error, /not configured/i)
+    assert.equal(app.ledger.serializeAccount(reg.agentId).spendableUsd, '5.000000')
+    assert.equal(app.ledger.getAgent(reg.agentId).reservedNano, 0n)
+
+    // 7C. Remote Streamable HTTP MCP (`POST /mcp`) + `/.well-known/agent-card.json` + `/v1/leaderboard`
+    const mcpInit = await postJson(`${url}/mcp`, { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
+    assert.equal(mcpInit.status, 200)
+    assert.equal(mcpInit.body.result.serverInfo.name, 'switch402-remote-mcp')
+
+    const mcpDesc = await postJson(`${url}/mcp`, {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'describe_capability', arguments: { capability: 'web.fetch_markdown' } },
+    })
+    assert.equal(mcpDesc.status, 200)
+    const descObj = JSON.parse(mcpDesc.body.result.content[0].text)
+    assert.equal(descObj.capability, 'act:web.fetch_markdown')
+    assert.ok(descObj.inputSchema?.properties?.url)
+
+    const cardRes = await fetch(`${url}/.well-known/agent-card.json`)
+    assert.equal(cardRes.status, 200)
+    const card = await cardRes.json()
+    assert.equal(card.sandbox.freeCallsOnRegister, 10)
+    assert.equal(card.mcpHttpUrl, `${url}/mcp`)
+
+    const lbRes = await fetch(`${url}/v1/leaderboard`)
+    assert.equal(lbRes.status, 200)
+    const lb = await lbRes.json()
+    assert.ok(Array.isArray(lb.leaders))
+
+    assert.equal(app.ledger.verifyInvariant().balanced, true)
+  } finally {
+    await app.close()
   }
 })
 

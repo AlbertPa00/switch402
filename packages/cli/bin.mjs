@@ -179,11 +179,68 @@ async function main() {
   }
 
   if (cmd === 'serve') {
-    const apiKey = flags.key || process.env.SWITCH402_KEY || saved.apiKey
-    if (!apiKey) throw new Error('Run `switch402 register` first or pass --key ag_live_...')
+    let apiKey = flags.key || process.env.SWITCH402_KEY || saved.apiKey
+    if (!apiKey) {
+      // Zero-friction auto-registration on first `serve`
+      const identity = generateAgentIdentity()
+      const regRes = await fetch(`${serverUrl}/v1/agents/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: flags.name || `worker-${os.hostname().slice(0, 12)}`,
+          publicJwk: identity.publicJwk,
+          referredBy: flags.ref || null,
+        }),
+      })
+      const regData = await regRes.json()
+      if (!regRes.ok) throw new Error(regData.error || `Auto-registration failed: HTTP ${regRes.status}`)
+      apiKey = regData.apiKey
+      saveConfig({
+        serverUrl,
+        agentId: regData.agentId,
+        apiKey: regData.apiKey,
+        referralUrlParam: regData.referralUrlParam,
+        identity,
+      })
+      console.log(`[switch402] Auto-registered ${regData.agentId} (saved to ${CONFIG_PATH})`)
+    }
 
     const capabilities = []
     const handlers = {}
+    const localOpenAiUrl = String(flags['local-url'] || 'http://127.0.0.1:11434/v1').replace(/\/+$/, '')
+
+    if (flags['auto-ollama']) {
+      const ollamaBase = localOpenAiUrl.replace(/\/v1$/, '')
+      const tagsRes = await fetch(`${ollamaBase}/api/tags`, { signal: AbortSignal.timeout(5_000) })
+      if (!tagsRes.ok) {
+        throw new Error(`Could not query local Ollama at ${ollamaBase}/api/tags (HTTP ${tagsRes.status})`)
+      }
+      const tagsJson = await tagsRes.json()
+      const localModels = (tagsJson.models || []).map((m) => m.name).filter(Boolean)
+      if (localModels.length === 0) {
+        throw new Error('No models found in local Ollama. Pull one first (e.g. `ollama pull qwen3:32b`).')
+      }
+      let houseBook = []
+      try {
+        const mkt = await (await fetch(`${serverUrl}/v1/market`, { signal: AbortSignal.timeout(5_000) })).json()
+        houseBook = mkt.houseFallbackBook || []
+      } catch {
+        // fallback to default pricing
+      }
+      for (const modelName of localModels.slice(0, 32)) {
+        const houseMatch = houseBook.find((h) => h.model === modelName)
+        const pricePer1MUsd = flags.price
+          ? String(flags.price)
+          : houseMatch
+            ? (Number(houseMatch.houseBuyerPer1MUsd) * 0.85).toFixed(4)
+            : '0.10'
+        capabilities.push({
+          capability: `llm:${modelName}`,
+          pricePer1MUsd,
+          description: `Auto-detected Ollama node (${modelName})`,
+        })
+      }
+    }
 
     if (flags.model) {
       capabilities.push({
@@ -207,7 +264,7 @@ async function main() {
 
     if (capabilities.length === 0) {
       throw new Error(
-        'Pass --model <name> (proxies local Ollama/vLLM) and/or --skill <name> --script <file.mjs>'
+        'Pass --auto-ollama, --model <name> (proxies local Ollama/vLLM), and/or --skill <name> --script <file.mjs>'
       )
     }
 
@@ -216,16 +273,32 @@ async function main() {
       apiKey,
       capabilities,
       handlers,
-      localOpenAiUrl: flags['local-url'] || 'http://127.0.0.1:11434/v1',
+      localOpenAiUrl,
       localOpenAiKey: flags['local-key'] || 'ollama',
     })
 
+    let completedCount = 0
     worker.on('ready', (info) => {
       console.log(`[switch402] Connected as ${info.agentId} (${info.sessionId})`)
       console.log(`[switch402] Live capabilities: ${info.registeredCapabilities.join(', ')}`)
     })
-    worker.on('job_completed', (j) => {
-      console.log(`[switch402] Settled job ${j.jobId} (${j.capability})`)
+    worker.on('job_completed', async (j) => {
+      completedCount += 1
+      let ticker = ''
+      if (completedCount === 1 || completedCount % 5 === 0) {
+        try {
+          const me = await (
+            await fetch(`${serverUrl}/v1/agents/me`, {
+              headers: { Authorization: `Bearer ${apiKey}` },
+              signal: AbortSignal.timeout(4_000),
+            })
+          ).json()
+          ticker = ` | Spendable: $${me.spendableUsd} | Bond: $${me.bondedUsd}/$${me.bondTargetUsd}`
+        } catch {
+          // ignore transient status fetch errors
+        }
+      }
+      console.log(`[switch402] Settled #${completedCount} ${j.jobId} (${j.capability})${ticker}`)
     })
     worker.on('job_cancelled', (j) => {
       console.log(`[switch402] Aborted cancelled job ${j.jobId} (${j.reason})`)
@@ -242,9 +315,10 @@ async function main() {
   console.log(`Switch402 CLI — Stateless Agent Inference & Action Grid
 Commands:
   switch402 register [--server URL] [--name HANDLE] [--ref ag_xxx]
+  switch402 serve --auto-ollama [--server URL] [--local-url http://127.0.0.1:11434/v1]
   switch402 serve --model qwen/qwen3-32b --price 0.12 [--local-url http://127.0.0.1:11434/v1]
   switch402 serve --skill web.scrape --script ./handler.mjs --price 0.0004
-  switch402 act <skill> --input '{"text":"hello"}'
+  switch402 act <skill> --input '{"url":"https://example.com"}'
   switch402 deposit --amount 5.00
   switch402 withdraw --amount 2.50 --dest <lightning_addr_or_bolt11>
   switch402 market

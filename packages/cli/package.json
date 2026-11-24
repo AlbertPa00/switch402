@@ -1,6 +1,6 @@
 {
   "name": "switch402",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "license": "MIT",
   "description": "Switch402 CLI & Outbound WebSocket Seller Daemon — sell idle GPU inference or JSON skills (keep 95%) and call the Switch402 agent grid via x402 or Lightning",

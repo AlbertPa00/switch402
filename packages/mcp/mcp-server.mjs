@@ -86,9 +86,24 @@ const TOOLS = [
       properties: {
         query: {
           type: 'string',
-          description: 'Optional keyword filter (e.g. "sha256", "verify", "qwen", "scrape")',
+          description: 'Optional keyword filter (e.g. "fetch_markdown", "sha256", "verify", "qwen")',
         },
       },
+    },
+  },
+  {
+    name: 'describe_capability',
+    description:
+      'Inspect exact inputSchema, example JSON payload, and live pricing for any Switch402 skill or model before calling it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        capability: {
+          type: 'string',
+          description: 'Skill or model name (e.g. "web.fetch_markdown", "web.verify_url", "switch402/instant-test")',
+        },
+      },
+      required: ['capability'],
     },
   },
   {
@@ -100,7 +115,7 @@ const TOOLS = [
       properties: {
         skill: {
           type: 'string',
-          description: 'Skill identifier without act: prefix (e.g. "util.sha256", "web.verify_url")',
+          description: 'Skill identifier without act: prefix (e.g. "web.fetch_markdown", "web.verify_url", "util.sha256")',
         },
         input: {
           type: 'object',
@@ -117,7 +132,7 @@ const TOOLS = [
   {
     name: 'chat_inference',
     description:
-      'Run chat completion inference on any model available on the Switch402 P2P + House grid.',
+      'Run chat completion inference on any model on Switch402. Every registered agent gets 10 FREE sandbox calls on "switch402/instant-test"!',
     inputSchema: {
       type: 'object',
       properties: {
@@ -149,11 +164,40 @@ const TOOLS = [
   {
     name: 'wallet_status',
     description:
-      'View your Switch402 agent ID, spendable USD balance, $2.00 Earned Quality Bond status, referral earnings, and top-up instructions.',
+      'View your Switch402 agent ID, spendable USD balance, free sandbox calls remaining, $2.00 Earned Quality Bond status, and referral earnings.',
     inputSchema: {
       type: 'object',
       properties: {},
     },
+  },
+  {
+    name: 'deposit_lightning',
+    description:
+      'Generate a Bitcoin Lightning (bolt11) deposit invoice to top up your Switch402 agent balance.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        amountUsd: {
+          type: 'number',
+          description: 'Deposit amount in USD (between 0.01 and 10000, default 1.00)',
+        },
+      },
+    },
+  },
+]
+
+const RESOURCES = [
+  {
+    uri: 'switch402://market',
+    name: 'Switch402 Live Market Orderbook',
+    description: 'Live P2P capabilities, House fallback prices, and unmet demand arbitrage feed',
+    mimeType: 'application/json',
+  },
+  {
+    uri: 'switch402://wallet',
+    name: 'Switch402 Agent Wallet',
+    description: 'Your agent ID, spendable USD balance, free sandbox calls, and Earned Quality Bond',
+    mimeType: 'application/json',
   },
 ]
 
@@ -174,12 +218,28 @@ async function executeTool(name, toolArgs = {}) {
     }
   }
 
+  if (name === 'describe_capability') {
+    const resp = await fetch(`${SERVER_URL}/v1/market`, { signal: AbortSignal.timeout(10_000) })
+    const market = await resp.json()
+    const target = String(toolArgs.capability || '').trim()
+    const all = [...(market.p2pBook || []), ...(market.houseFallbackBook || [])]
+    const found = all.find(
+      (x) =>
+        x.capability === target ||
+        x.skill === target ||
+        x.model === target ||
+        x.capability === `act:${target}` ||
+        x.capability === `llm:${target}`
+    )
+    return found || { error: `Capability "${target}" not found`, available: all.map((x) => x.capability) }
+  }
+
   if (name === 'list_unmet_demand') {
     const resp = await fetch(`${SERVER_URL}/v1/market`, { signal: AbortSignal.timeout(10_000) })
     const market = await resp.json()
     return {
       unmetDemandFeed: market.unmetDemandFeed || [],
-      tip: 'Run `npx switch402 serve --model <id> --price <suggestedUndercutUsd>` to capture 100% of flow.',
+      tip: 'Run `npx switch402 serve --auto-ollama` or `npx switch402 serve --model <id> --price <suggestedUndercutUsd>` to capture 100% of flow.',
     }
   }
 
@@ -188,6 +248,20 @@ async function executeTool(name, toolArgs = {}) {
     const resp = await fetch(`${SERVER_URL}/v1/agents/me`, {
       headers: { Authorization: `Bearer ${key}` },
       signal: AbortSignal.timeout(10_000),
+    })
+    return await resp.json()
+  }
+
+  if (name === 'deposit_lightning') {
+    const key = await ensureApiKey()
+    const resp = await fetch(`${SERVER_URL}/v1/wallet/deposit/lightning`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({ amountUsd: toolArgs.amountUsd ?? 1.0 }),
+      signal: AbortSignal.timeout(12_000),
     })
     return await resp.json()
   }
@@ -208,7 +282,20 @@ async function executeTool(name, toolArgs = {}) {
       body: JSON.stringify(toolArgs.input || {}),
       signal: AbortSignal.timeout(45_000),
     })
-    return await resp.json()
+    const body = await resp.json()
+    if (resp.status === 402) {
+      return {
+        status: 402,
+        ...body,
+        nextSteps: {
+          tryFreeSandbox: 'Call chat_inference with model="switch402/instant-test" (10 free sandbox calls included!)',
+          topupLightning: 'Call deposit_lightning(amountUsd=1.0) to get a bolt11 invoice',
+          topupBaseUsdc: `POST ${SERVER_URL}/v1/wallet/topup/x402?amountUsd=1.00`,
+          earnCreditsFree: `npx switch402 serve --auto-ollama --server ${SERVER_URL}`,
+        },
+      }
+    }
+    return body
   }
 
   if (name === 'chat_inference') {
@@ -231,11 +318,24 @@ async function executeTool(name, toolArgs = {}) {
       signal: AbortSignal.timeout(60_000),
     })
     const json = await resp.json()
+    if (resp.status === 402) {
+      return {
+        status: 402,
+        ...json,
+        nextSteps: {
+          tryFreeSandbox: 'Call chat_inference with model="switch402/instant-test" (10 free sandbox calls included!)',
+          topupLightning: 'Call deposit_lightning(amountUsd=1.0) to get a bolt11 invoice',
+          topupBaseUsdc: `POST ${SERVER_URL}/v1/wallet/topup/x402?amountUsd=1.00`,
+          earnCreditsFree: `npx switch402 serve --auto-ollama --server ${SERVER_URL}`,
+        },
+      }
+    }
     return {
       status: resp.status,
       receiptId: resp.headers.get('x-switch402-receipt'),
       mode: resp.headers.get('x-switch402-mode'),
       costUsd: resp.headers.get('x-switch402-cost-usd'),
+      sandboxRemaining: resp.headers.get('x-switch402-sandbox-remaining'),
       reply: json?.choices?.[0]?.message?.content ?? json,
     }
   }
@@ -258,8 +358,8 @@ async function handleRpcMessage(msg) {
         id: msg.id,
         result: {
           protocolVersion: msg.params?.protocolVersion || '2024-11-05',
-          capabilities: { tools: {} },
-          serverInfo: { name: 'switch402-mcp', version: '0.1.0' },
+          capabilities: { tools: {}, resources: {} },
+          serverInfo: { name: 'switch402-mcp', version: '0.1.2' },
         },
       })
       return
@@ -275,6 +375,47 @@ async function handleRpcMessage(msg) {
         jsonrpc: '2.0',
         id: msg.id,
         result: { tools: TOOLS },
+      })
+      return
+    }
+
+    if (msg.method === 'resources/list') {
+      sendRpc({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { resources: RESOURCES },
+      })
+      return
+    }
+
+    if (msg.method === 'resources/read') {
+      const uri = msg.params?.uri
+      if (uri === 'switch402://market') {
+        const data = await executeTool('find_capability', {})
+        sendRpc({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(data, null, 2) }],
+          },
+        })
+        return
+      }
+      if (uri === 'switch402://wallet') {
+        const data = await executeTool('wallet_status', {})
+        sendRpc({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(data, null, 2) }],
+          },
+        })
+        return
+      }
+      sendRpc({
+        jsonrpc: '2.0',
+        id: msg.id,
+        error: { code: -32602, message: `Unknown resource URI: ${uri}` },
       })
       return
     }

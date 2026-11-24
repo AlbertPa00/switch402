@@ -48,6 +48,8 @@ export class PaymentEngine {
     this.coinosApiToken = opts.coinosApiToken || ''
     this.webhookSecret = opts.webhookSecret || ''
     this.btcUsdRate = opts.btcUsdRate || 95_000
+    this._btcRateFetchedAt = 0
+    this.enableLiveBtcRate = opts.enableLiveBtcRate ?? Boolean(opts.coinosApiToken)
     this.maxHourlyWithdrawNano = opts.maxHourlyWithdrawNano || usdToNano('100.00')
 
     /** @type {Map<string, any>} invoiceId -> PendingInvoice */
@@ -145,11 +147,10 @@ export class PaymentEngine {
           scheme: 'exact',
           network: 'eip155:8453',
           amount: atomicStr,
-          maxAmountRequired: atomicStr,
           payTo: this.payToEvm,
           asset: this.usdcBaseAddress,
           maxTimeoutSeconds: 60,
-          extra: { name: 'USDC', version: '2' },
+          extra: { name: 'USD Coin', version: '2' },
         },
       ],
       extensions: {
@@ -195,6 +196,7 @@ export class PaymentEngine {
     try {
       const requirement = challengePayload.accepts[0]
       let settledTxHash = null
+      let paymentResponseHeader = null
 
       if (this.customX402Verifier) {
         const res = await this.customX402Verifier(paymentHeader, requirement)
@@ -202,20 +204,50 @@ export class PaymentEngine {
           return { ok: false, error: res?.invalidReason || 'Invalid or unsettled x402 signature' }
         }
         settledTxHash = res.txHash || sigHash
+        paymentResponseHeader = Buffer.from(
+          JSON.stringify({ success: true, transaction: settledTxHash, network: requirement.network }),
+          'utf8'
+        ).toString('base64')
       } else {
+        let paymentPayload
+        try {
+          const decoded = Buffer.from(paymentHeader, 'base64').toString('utf8')
+          paymentPayload = JSON.parse(decoded)
+        } catch {
+          try {
+            paymentPayload = JSON.parse(paymentHeader)
+          } catch {
+            return { ok: false, error: 'Malformed base64 JSON in PAYMENT-SIGNATURE header' }
+          }
+        }
+
+        // Attach resource + bazaar extension if client omitted them so PayAI Bazaar indexes on settle!
+        if (!paymentPayload.resource && challengePayload.resource) {
+          paymentPayload.resource = challengePayload.resource
+        }
+        if (!paymentPayload.extensions && challengePayload.extensions) {
+          paymentPayload.extensions = challengePayload.extensions
+        }
+
+        const facilitatorReqBody = JSON.stringify({
+          x402Version: paymentPayload.x402Version || 2,
+          paymentPayload,
+          paymentRequirements: requirement,
+        })
+
         // Step 1: Verify EIP-3009 authorization signature & parameters
         const verifyResp = await fetch(`${this.facilitatorUrl}/verify`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            x402Version: 2,
-            paymentHeader,
-            paymentRequirements: requirement,
-          }),
+          body: facilitatorReqBody,
           signal: AbortSignal.timeout(15_000),
         })
         if (!verifyResp.ok) {
-          return { ok: false, error: `Facilitator /verify HTTP ${verifyResp.status}` }
+          const errText = await verifyResp.text().catch(() => '')
+          return {
+            ok: false,
+            error: `Facilitator /verify HTTP ${verifyResp.status}: ${errText.slice(0, 160)}`,
+          }
         }
         const verifyJson = await verifyResp.json()
         if (!verifyJson?.isValid) {
@@ -225,29 +257,33 @@ export class PaymentEngine {
           }
         }
 
-        // Step 2: Settle EIP-3009 transferWithAuthorization on Base so USDC actually lands in payTo!
+        // Step 2: Settle EIP-3009 transferWithAuthorization on Base so USDC settles on-chain & indexes in Bazaar!
         const settleResp = await fetch(`${this.facilitatorUrl}/settle`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            x402Version: 2,
-            paymentHeader,
-            paymentRequirements: requirement,
-          }),
-          signal: AbortSignal.timeout(25_000),
+          body: facilitatorReqBody,
+          signal: AbortSignal.timeout(30_000),
         })
         if (!settleResp.ok) {
-          return { ok: false, error: `Facilitator /settle HTTP ${settleResp.status}` }
+          const errText = await settleResp.text().catch(() => '')
+          return {
+            ok: false,
+            error: `Facilitator /settle HTTP ${settleResp.status}: ${errText.slice(0, 160)}`,
+          }
         }
         const settleJson = await settleResp.json()
         if (settleJson?.success === false) {
           return {
             ok: false,
-            error: settleJson?.error || settleJson?.errorReason || 'x402 on-chain settlement failed',
+            error:
+              settleJson?.error ||
+              settleJson?.errorReason ||
+              'x402 on-chain settlement failed',
           }
         }
         settledTxHash =
-          settleJson?.txHash || settleJson?.transaction || verifyJson?.txHash || sigHash
+          settleJson?.transaction || settleJson?.txHash || verifyJson?.txHash || sigHash
+        paymentResponseHeader = Buffer.from(JSON.stringify(settleJson), 'utf8').toString('base64')
       }
 
       const txKey = `x402:${settledTxHash}`
@@ -276,10 +312,33 @@ export class PaymentEngine {
         creditedNano: creditNano,
         creditedUsd: nanoToUsd(creditNano),
         txId: txKey,
+        paymentResponseHeader,
       }
     } finally {
       this.inFlightPayments.delete(sigHash)
     }
+  }
+
+  async getBtcUsdRate() {
+    if (!this.enableLiveBtcRate) return this.btcUsdRate
+    const now = Date.now()
+    if (now - this._btcRateFetchedAt < 300_000) return this.btcUsdRate
+    try {
+      const resp = await fetch('https://api.coinbase.com/v2/prices/BTC-USD/spot', {
+        signal: AbortSignal.timeout(4_000),
+      })
+      if (resp.ok) {
+        const json = await resp.json()
+        const spot = Number(json?.data?.amount)
+        if (Number.isFinite(spot) && spot > 1_000) {
+          this.btcUsdRate = spot
+          this._btcRateFetchedAt = now
+        }
+      }
+    } catch {
+      // Keep last known rate on transient network error
+    }
+    return this.btcUsdRate
   }
 
   /**
@@ -293,8 +352,9 @@ export class PaymentEngine {
       throw new Error('amountUsd must be between 0.01 and 10000')
     }
 
+    const btcRate = await this.getBtcUsdRate()
     const creditNano = usdToNano(usdNum.toFixed(6))
-    const sats = Math.max(Math.ceil((usdNum / this.btcUsdRate) * 100_000_000), 1)
+    const sats = Math.max(Math.ceil((usdNum / btcRate) * 100_000_000), 1)
     const invoiceId = `lninv_${randomBytes(8).toString('hex')}`
 
     let bolt11 = `lnbc${sats}n1p_switch402_${invoiceId}`
@@ -444,8 +504,9 @@ export class PaymentEngine {
 
     try {
       let externalTxId = null
+      const btcRate = await this.getBtcUsdRate()
       const usdFloat = Number(nanoToUsd(amountNano, 6))
-      const sats = Math.max(Math.floor((usdFloat / this.btcUsdRate) * 100_000_000), 1)
+      const sats = Math.max(Math.floor((usdFloat / btcRate) * 100_000_000), 1)
 
       if (this.customPayoutExecutor) {
         const res = await this.customPayoutExecutor({
@@ -475,6 +536,10 @@ export class PaymentEngine {
         }
         const sentData = await resp.json()
         externalTxId = sentData?.hash || sentData?.id || null
+      } else {
+        throw new Error(
+          `Payout rail "${rail}" is not configured on this server yet. Your balance remains intact and spendable on Switch402 calls.`
+        )
       }
 
       return this.ledger.commitWithdrawal({

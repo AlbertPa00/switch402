@@ -36,6 +36,9 @@ export class NanoLedger {
     this.referrerShareBps = opts.referrerShareBps ?? 1500
     this.houseMarginBps = opts.houseMarginBps ?? 1000
     this.earnedBondTargetNano = opts.earnedBondTargetNano ?? usdToNano('2.00')
+    this.defaultSandboxCalls = opts.defaultSandboxCalls ?? 10
+    this.walCompactThreshold = opts.walCompactThreshold ?? 5000
+    this._walEventsSinceCompact = 0
 
     /** @type {Map<string, any>} agentId -> Account */
     this.accounts = new Map()
@@ -144,6 +147,7 @@ export class NanoLedger {
       referredBy: validReferrer,
       evmAddress: evmAddress ? String(evmAddress).slice(0, 64) : null,
       lightningAddress: lightningAddress ? String(lightningAddress).slice(0, 120) : null,
+      sandboxCallsRemaining: this.defaultSandboxCalls,
     }
 
     this._applyEvent(event)
@@ -155,6 +159,32 @@ export class NanoLedger {
       keyThumbprint: thumbprint,
       referredBy: validReferrer,
       referralUrlParam: `?ref=${agentId}`,
+      sandboxCallsRemaining: this.defaultSandboxCalls,
+    }
+  }
+
+  /**
+   * Consume 1 free sandbox call on `switch402/instant-test` (zero financial liability, preserves conservation law).
+   */
+  consumeSandboxCall(agentId, capability = 'llm:switch402/instant-test', latencyMs = 0) {
+    const acct = this.accounts.get(agentId)
+    if (!acct || acct.banned || (acct.sandboxCallsRemaining || 0) <= 0) return null
+    const receiptId = `rcpt_sbx_${randomBytes(5).toString('hex')}`
+    const event = {
+      type: 'SANDBOX_USE',
+      ts: Date.now(),
+      receiptId,
+      agentId,
+      capability,
+      latencyMs,
+    }
+    this._applyEvent(event)
+    this._appendWal(event)
+    return {
+      receiptId,
+      mode: 'sandbox_free',
+      grossNano: 0n,
+      remainingSandboxCalls: acct.sandboxCallsRemaining,
     }
   }
 
@@ -644,6 +674,7 @@ export class NanoLedger {
       bondTargetUsd: nanoToUsd(this.earnedBondTargetNano),
       bondComplete: a.bondedNano >= this.earnedBondTargetNano,
       reservedNano: a.reservedNano.toString(),
+      sandboxCallsRemaining: a.sandboxCallsRemaining ?? 0,
       stats: {
         callsServed: a.stats.callsServed,
         callsBought: a.stats.callsBought,
@@ -714,6 +745,7 @@ export class NanoLedger {
           spendableNano: 0n,
           bondedNano: 0n,
           reservedNano: 0n,
+          sandboxCallsRemaining: ev.sandboxCallsRemaining ?? 0,
           stats: {
             earnedNano: 0n,
             spentNano: 0n,
@@ -824,6 +856,26 @@ export class NanoLedger {
         this.withdrawHistory.set(ev.agentId, hist)
         break
       }
+
+      case 'SANDBOX_USE': {
+        const acct = this.accounts.get(ev.agentId)
+        if (acct) {
+          acct.sandboxCallsRemaining = Math.max((acct.sandboxCallsRemaining || 0) - 1, 0)
+          acct.stats.callsBought += 1
+        }
+        this.totalSettledCalls += 1
+        this._pushReceipt({
+          receiptId: ev.receiptId,
+          ts: ev.ts,
+          type: 'SANDBOX_USE',
+          capability: ev.capability,
+          buyerId: ev.agentId,
+          sellerId: 'switch402_sandbox',
+          grossNano: '0',
+          latencyMs: ev.latencyMs || 0,
+        })
+        break
+      }
     }
   }
 
@@ -831,11 +883,16 @@ export class NanoLedger {
     this.recentReceipts.push({
       receiptId: ev.receiptId,
       ts: ev.ts,
-      mode: ev.type === 'SETTLE_P2P' ? 'p2p' : 'house',
+      mode:
+        ev.type === 'SETTLE_P2P'
+          ? 'p2p'
+          : ev.type === 'SANDBOX_USE'
+            ? 'sandbox'
+            : 'house',
       capability: ev.capability,
       buyerId: ev.buyerId,
       sellerId: ev.sellerId || 'house_upstream',
-      grossUsd: nanoToUsd(ev.grossNano || ev.buyerTotalNano, 6),
+      grossUsd: nanoToUsd(ev.grossNano || ev.buyerTotalNano || '0', 6),
       latencyMs: ev.latencyMs,
     })
     if (this.recentReceipts.length > 200) {
@@ -846,6 +903,15 @@ export class NanoLedger {
   _appendWal(ev) {
     if (this._walFd === null) return
     fs.writeSync(this._walFd, `${JSON.stringify(ev)}\n`)
+    this._walEventsSinceCompact += 1
+    if (this.walCompactThreshold > 0 && this._walEventsSinceCompact >= this.walCompactThreshold) {
+      this._walEventsSinceCompact = 0
+      try {
+        this.compactSnapshot()
+      } catch {
+        // Best-effort auto-compaction
+      }
+    }
   }
 
   _loadFromDisk() {
@@ -882,9 +948,19 @@ export class NanoLedger {
     const walPath = path.join(this.dataDir, 'ledger.wal.jsonl')
     if (fs.existsSync(walPath)) {
       const lines = fs.readFileSync(walPath, 'utf8').split('\n')
-      for (const line of lines) {
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]
         if (!line.trim()) continue
-        const ev = JSON.parse(line)
+        let ev
+        try {
+          ev = JSON.parse(line)
+        } catch (err) {
+          // Tolerate a torn/partial last line after an abrupt power loss or OOM kill
+          if (i === lines.length - 1 || lines.slice(i + 1).every((l) => !l.trim())) {
+            break
+          }
+          throw err
+        }
         // Replay balances mutated via reservation consumption in live runtime
         if (ev.type === 'SETTLE_P2P') {
           const buyer = this.accounts.get(ev.buyerId)

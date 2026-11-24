@@ -125,6 +125,58 @@ export class HouseUpstream {
       'util.json_validate': '0.0005',
       'util.markdown_clean': '0.0008',
       'web.verify_url': '0.0010',
+      'web.fetch_markdown': '0.0012',
+    }
+
+    this.skillMeta = {
+      'util.sha256': {
+        description: 'Compute SHA-256 hex digest and UTF-8 byte length of a string',
+        inputSchema: {
+          type: 'object',
+          properties: { text: { type: 'string', description: 'Input text to hash' } },
+          required: ['text'],
+        },
+        example: { text: 'hello world' },
+      },
+      'util.json_validate': {
+        description: 'Validate JSON syntax and report parsed root type or parse error',
+        inputSchema: {
+          type: 'object',
+          properties: { json: { type: 'string', description: 'JSON string or value to validate' } },
+          required: ['json'],
+        },
+        example: { json: '{"ok":true}' },
+      },
+      'util.markdown_clean': {
+        description: 'Strip HTML tags, scripts, and styles into clean plaintext/markdown',
+        inputSchema: {
+          type: 'object',
+          properties: { html: { type: 'string', description: 'Raw HTML content' } },
+          required: ['html'],
+        },
+        example: { html: '<h1>Hello</h1><p>World</p>' },
+      },
+      'web.verify_url': {
+        description: 'SSRF-safe HTTP notary: fetch public URL and return status, byte length, SHA-256, and UTC timestamp',
+        inputSchema: {
+          type: 'object',
+          properties: { url: { type: 'string', description: 'Public http(s) URL to notarize' } },
+          required: ['url'],
+        },
+        example: { url: 'https://example.com' },
+      },
+      'web.fetch_markdown': {
+        description: 'SSRF-safe web reader: fetch any public URL and return clean readable Markdown + page title',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', description: 'Public http(s) URL to fetch and convert to Markdown' },
+            maxChars: { type: 'number', description: 'Optional max output character length (default 16000, max 64000)' },
+          },
+          required: ['url'],
+        },
+        example: { url: 'https://example.com', maxChars: 8000 },
+      },
     }
 
     /** @type {Map<string, { calls: number, lastCallAt: number }>} */
@@ -149,13 +201,19 @@ export class HouseUpstream {
         houseBuyerPer1MUsd: (Number(wholesalePer1M) * 1.1).toFixed(4),
       }))
 
-    const skills = Object.entries(this.skillWholesaleUsd).map(([skill, wholesaleUsd]) => ({
-      capability: `act:${skill}`,
-      kind: 'act',
-      skill,
-      houseWholesaleUsd: wholesaleUsd,
-      houseBuyerUsd: (Number(wholesaleUsd) * 1.1).toFixed(6),
-    }))
+    const skills = Object.entries(this.skillWholesaleUsd).map(([skill, wholesaleUsd]) => {
+      const meta = this.skillMeta[skill] || {}
+      return {
+        capability: `act:${skill}`,
+        kind: 'act',
+        skill,
+        description: meta.description || `Atomic capability ${skill}`,
+        inputSchema: meta.inputSchema || null,
+        example: meta.example || null,
+        houseWholesaleUsd: wholesaleUsd,
+        houseBuyerUsd: (Number(wholesaleUsd) * 1.1).toFixed(6),
+      }
+    })
 
     return [...models, ...skills]
   }
@@ -333,6 +391,59 @@ export class HouseUpstream {
         }
       }
 
+      case 'web.fetch_markdown': {
+        let currentUrl = String(input.url || '')
+        let resp = null
+        for (let hop = 0; hop < 4; hop++) {
+          const safeUrl = await assertSafePublicUrl(currentUrl)
+          resp = await fetch(safeUrl.href, {
+            headers: {
+              'User-Agent': 'Switch402-Reader/1.0 (+https://switch402.fly.dev)',
+              Accept: 'text/html,text/markdown,text/plain;q=0.9,*/*;q=0.1',
+            },
+            redirect: 'manual',
+            signal: AbortSignal.timeout(12_000),
+          })
+          if (resp.status >= 300 && resp.status < 400 && resp.headers.get('location')) {
+            currentUrl = new URL(resp.headers.get('location'), safeUrl.href).href
+            continue
+          }
+          break
+        }
+
+        const chunks = []
+        let totalBytes = 0
+        if (resp.body) {
+          for await (const chunk of resp.body) {
+            totalBytes += chunk.length
+            if (totalBytes > MAX_VERIFY_BODY_BYTES) {
+              throw new Error(`Target response exceeded ${MAX_VERIFY_BODY_BYTES} byte Reader cap`)
+            }
+            chunks.push(chunk)
+          }
+        }
+        const rawText = Buffer.concat(chunks).toString('utf8')
+        const titleMatch = rawText.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+        const title = titleMatch ? decodeBasicEntities(titleMatch[1].replace(/\s+/g, ' ').trim()) : ''
+        const maxChars = Math.min(Math.max(Number(input.maxChars || 16_000), 200), 64_000)
+        const md = htmlToReadableMarkdown(rawText)
+        const truncated = md.length > maxChars
+        const markdown = truncated ? `${md.slice(0, maxChars)}\n\n[truncated]` : md
+
+        return {
+          wholesaleNano,
+          output: {
+            url: currentUrl,
+            status: resp.status,
+            title,
+            markdown,
+            length: markdown.length,
+            truncated,
+            fetchedUtc: new Date().toISOString(),
+          },
+        }
+      }
+
       default:
         throw new Error(`Unsupported House skill: ${skill}`)
     }
@@ -397,4 +508,35 @@ export class HouseUpstream {
       },
     }
   }
+}
+
+function decodeBasicEntities(str) {
+  return String(str || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+}
+
+function htmlToReadableMarkdown(html) {
+  return decodeBasicEntities(
+    String(html || '')
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+      .replace(/<svg[\s\S]*?<\/svg>/gi, '')
+      .replace(/<(h1)[^>]*>([\s\S]*?)<\/\1>/gi, '\n\n# $2\n\n')
+      .replace(/<(h2)[^>]*>([\s\S]*?)<\/\1>/gi, '\n\n## $2\n\n')
+      .replace(/<(h3)[^>]*>([\s\S]*?)<\/\1>/gi, '\n\n### $2\n\n')
+      .replace(/<(h[4-6])[^>]*>([\s\S]*?)<\/\1>/gi, '\n\n#### $2\n\n')
+      .replace(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)')
+      .replace(/<li[^>]*>/gi, '\n- ')
+      .replace(/<\/?(p|div|br|tr|section|article|header|footer|main)[^>]*>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+  )
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 }

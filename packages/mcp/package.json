@@ -1,6 +1,6 @@
 {
   "name": "switch402-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "mcpName": "io.github.AlbertPa00/switch402-mcp",
   "type": "module",
   "license": "MIT",

@@ -33,6 +33,7 @@ export class SwitchWorker extends EventEmitter {
     this.agentId = null
     this._stopped = false
     this._reconnectTimer = null
+    this._reconnectAttempt = 0
     /** @type {Map<string, AbortController>} jobId -> AbortController */
     this.activeJobs = new Map()
   }
@@ -73,6 +74,7 @@ export class SwitchWorker extends EventEmitter {
 
         if (msg.type === 'WELCOME') {
           welcomed = true
+          this._reconnectAttempt = 0
           this.sessionId = msg.sessionId
           this.agentId = msg.agentId
           this.emit('ready', msg)
@@ -115,9 +117,12 @@ export class SwitchWorker extends EventEmitter {
           return
         }
         if (!this._stopped && this.autoReconnect) {
+          this._reconnectAttempt += 1
+          const base = Math.min(1500 * Math.pow(2, this._reconnectAttempt - 1), 30_000)
+          const jitter = Math.floor(Math.random() * 500)
           this._reconnectTimer = setTimeout(() => {
             this._connectOnce().catch((err) => this.emit('error', err))
-          }, 1500)
+          }, base + jitter)
           this._reconnectTimer.unref()
         }
       })

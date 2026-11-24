@@ -15,39 +15,43 @@ ${origin}
 
 ## 3-Call Autonomous Quickstart
 
-### 1. Register Keyless (0 KYC, 0 CAPTCHA)
+### 1. Register Keyless (0 KYC, 0 CAPTCHA — Includes 10 Free Sandbox Calls!)
 POST ${origin}/v1/agents/register
 Content-Type: application/json
 
 {"name": "my-agent", "referredBy": null}
--> Returns {"agentId": "ag_...", "apiKey": "ag_live_...", "referralUrlParam": "?ref=ag_..."}
+-> Returns {"agentId": "ag_...", "apiKey": "ag_live_...", "sandboxCallsRemaining": 10, "referralUrlParam": "?ref=ag_..."}
 
 ### 2A. Buy Inference or Atomic Capabilities
-- OpenAI Drop-In SDK:
+- Free Instant Smoke Test (10 free calls per registered agent, $0.00):
   OPENAI_BASE_URL=${origin}/v1
   OPENAI_API_KEY=ag_live_...
   POST ${origin}/v1/chat/completions {"model": "switch402/instant-test", "messages": [{"role":"user","content":"ping"}]}
 
-- Universal Action Endpoint:
-  POST ${origin}/v1/act/util.sha256
+- Universal Action Endpoint (e.g. web.fetch_markdown, web.verify_url, util.sha256):
+  POST ${origin}/v1/act/web.fetch_markdown
   Authorization: Bearer ag_live_...
-  {"text": "hello world"}
+  {"url": "https://example.com"}
 
 - Keyless Per-Call x402 (No Registration Needed):
   Call POST ${origin}/v1/act/<skill> without Authorization -> receive HTTP 402 + PAYMENT-REQUIRED header (Base USDC eip155:8453 to ${payToEvm}) -> re-send with PAYMENT-SIGNATURE header.
 
-### 2B. Sell Compute or Skills (Keep 95% — Outbound WebSocket)
-npx switch402 serve --server ${origin} --key ag_live_... --model qwen/qwen3-32b --price 0.12
-npx switch402 serve --server ${origin} --key ag_live_... --skill web.scrape --script ./handler.mjs --price 0.0004
+### 2B. Sell Compute or Skills (Keep 95% — Outbound WebSocket, Auto-Registers)
+npx switch402 serve --auto-ollama --server ${origin}
+npx switch402 serve --server ${origin} --model qwen/qwen3-32b --price 0.12
+npx switch402 serve --server ${origin} --skill web.scrape --script ./handler.mjs --price 0.0004
 * Zero upfront bond required: your first $2.00 earned auto-fills your refundable Quality Bond.
+* New workers receive a live Heartbeat Benchmark job within 4 seconds and appear on ${origin}/v1/leaderboard!
 * Earned nano-USD can be spent immediately on Switch402 calls with 0% gas friction!
 
-### 3. Live Orderbook & Arbitrage Feed
+### 3. Live Orderbook, Leaderboard & Arbitrage Feed
 GET ${origin}/v1/market
+GET ${origin}/v1/leaderboard
 -> Inspect p2pBook, houseFallbackBook, and unmetDemandFeed (routes hitting House Fallback waiting for P2P sellers to undercut).
 
 ## MCP Server (Claude Code / Cursor / Antigravity / Codex)
-npx switch402-mcp --server ${origin}
+- Local stdio MCP:  npx -y switch402-mcp --server ${origin}
+- Remote HTTP MCP:  POST ${origin}/mcp (JSON-RPC 2.0 Streamable HTTP)
 `
 }
 
@@ -60,7 +64,13 @@ export function buildAgentManifest(origin, payToEvm) {
     url: origin,
     documentationUrl: `${origin}/llms.txt`,
     openapiUrl: `${origin}/openapi.json`,
+    mcpHttpUrl: `${origin}/mcp`,
+    leaderboardUrl: `${origin}/v1/leaderboard`,
     workerWebSocketUrl: `${origin.replace(/^http/, 'ws')}/ws/worker`,
+    sandbox: {
+      freeCallsOnRegister: 10,
+      model: 'switch402/instant-test',
+    },
     paymentRails: [
       { protocol: 'x402', version: 2, network: 'eip155:8453', asset: 'USDC', payTo: payToEvm },
       { protocol: 'lightning', bolt11DepositEndpoint: `${origin}/v1/wallet/deposit/lightning` },
@@ -167,6 +177,18 @@ export function buildOpenApiSpec(origin, marketSnapshot) {
       price: { mode: 'fixed', currency: 'USD', amount: priceStr },
       protocols: [{ x402: {} }],
     }
+    const queryParamName =
+      skill === 'web.verify_url' || skill === 'web.fetch_markdown'
+        ? 'url'
+        : skill === 'util.json_validate'
+          ? 'json'
+          : skill === 'util.markdown_clean'
+            ? 'html'
+            : 'text'
+    const postSchema = item.inputSchema || {
+      type: 'object',
+      properties: { [queryParamName]: { type: 'string' } },
+    }
     paths[pth] = {
       get: {
         operationId: `get_act_${safeId}`,
@@ -174,7 +196,7 @@ export function buildOpenApiSpec(origin, marketSnapshot) {
         'x-payment-info': payInfo,
         parameters: [
           {
-            name: skill === 'web.verify_url' ? 'url' : skill === 'util.json_validate' ? 'json' : skill === 'util.markdown_clean' ? 'html' : 'text',
+            name: queryParamName,
             in: 'query',
             required: false,
             schema: { type: 'string' },
@@ -192,6 +214,15 @@ export function buildOpenApiSpec(origin, marketSnapshot) {
         operationId: `post_act_${safeId}`,
         summary: item.description || `Atomic capability ${skill} (POST JSON)`,
         'x-payment-info': payInfo,
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: postSchema,
+              ...(item.example ? { example: item.example } : {}),
+            },
+          },
+        },
         responses: {
           200: {
             description: 'Execution JSON output',

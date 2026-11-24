@@ -154,6 +154,7 @@ export class SellerRouter {
       agentName: acct.name || acct.id,
       ws,
       connectedAt: Date.now(),
+      lastPongAt: Date.now(),
       maxConcurrency: Math.min(Math.max(Number(msg.maxConcurrency || 8), 1), 128),
       inFlight: 0,
       emaSuccess: 0.98,
@@ -162,6 +163,10 @@ export class SellerRouter {
       /** @type {Map<string, any>} jobId -> PendingJob */
       pendingJobs: new Map(),
     }
+
+    ws.on('pong', () => {
+      session.lastPongAt = Date.now()
+    })
 
     this.sessions.set(sessionId, session)
     for (const capName of capsMap.keys()) {
@@ -688,7 +693,13 @@ export class SellerRouter {
   }
 
   _heartbeat() {
-    for (const s of this.sessions.values()) {
+    const now = Date.now()
+    for (const s of Array.from(this.sessions.values())) {
+      if (now - (s.lastPongAt || s.connectedAt) > 50_000) {
+        s.ws.close(1001, 'Heartbeat pong timeout')
+        this._evictSession(s.sessionId, 'Worker heartbeat pong timeout')
+        continue
+      }
       if (s.ws.readyState === 1) s.ws.ping()
     }
   }

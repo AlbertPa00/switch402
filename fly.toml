@@ -12,6 +12,8 @@ primary_region = "iad"
   DATA_DIR = "/app/data"
   PAYTO_EVM = "0xeDC5e77f1f0a2dd9Ab919687d54af2f312387A63"
   X402_FACILITATOR_URL = "https://facilitator.payai.network"
+  HEARTBEAT_ENABLED = "true"
+  HEARTBEAT_DAILY_USD = "0.14"
 
 [mounts]
   source = "switch402_data"
