@@ -213,6 +213,12 @@ async function handleHttpRequest(req, res, ctx) {
     return
   }
 
+  if (method === 'GET' && pathname === '/.well-known/mcp-registry-auth') {
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
+    res.end('v=MCPv1; k=ed25519; p=ujSTzdO+991z3DJAygtAy/THVcu7LkO3zaFhaXs1jW4=')
+    return
+  }
+
   if (method === 'GET' && pathname === '/.well-known/x402') {
     const snap = router.getMarketSnapshot()
     const resources = snap.houseFallbackBook

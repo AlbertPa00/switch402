@@ -24,5 +24,11 @@
         }
       ]
     }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://switch402.fly.dev/mcp"
+    }
   ]
 }
