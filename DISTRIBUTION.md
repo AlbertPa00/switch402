@@ -7,10 +7,15 @@ Long-term userbase growth ops log. Update the status column as items land.
 | Channel | Status | Notes |
 |---|---|---|
 | x402scan (Merit Systems) | ✅ LIVE | All 8 resources registered 2026-11-24. Server page: https://www.x402scan.com/server/d1b06f8b-03cf-4c10-87fa-f8d6db630ef9 |
+| x402dash | 🟡 5/8 | Registered via `POST api.x402dash.com/v1/register` (free, 5/hr). chat/completions + 2 util.* pending — re-run after rate limit |
+| PayAI Bazaar | 🔲 needs settlement | Listing is automatic on first SETTLED payment per resource — client MUST echo `extensions.bazaar` in the payment payload (x402_buy.py now does). Fund Base wallet ~$0.10 USDC → run `python ../x402_buy.py` |
+| Agentic.Market (Coinbase) | 🔲 curated | No public submit; indexes from facilitator catalogs. Get Bazaar-listed first |
+| x402-list.com | 🔲 $1 fee | Free submit `POST /api/v1/submit` BUT fly.dev likely counts as free-compute host → one-off $1 USDC. NOTE: unrelated `api.switch402.com` service already listed there under "switch402" |
+| pay.sh registry | ❌ n/a | Solana-foundation MPP gateway stack (`pay` CLI) — catalogs provider gateways, not external x402 endpoints. Revisit only if we run an MPP gateway |
+| app.ampersend.ai | 🔲 account | Marketplace behind sign-in — human step |
 | Official MCP Registry | ✅ LIVE | `dev.fly.switch402/switch402` v0.1.3 published via HTTP (Ed25519) auth, remotes → `switch402.fly.dev/mcp`. Auto-feeds PulseMCP + Glama. |
 | Official MCP Registry (canonical) | ⏳ pending npm | `io.github.AlbertPa00/switch402-mcp` at 0.1.1 — republish 0.1.3 after `npm publish` (see below) |
 | awesome-mcp-servers | ⏳ PR open | https://github.com/punkpeye/awesome-mcp-servers/pull/20632 — Aggregators section, Glama badge in README |
-| PayAI Bazaar | ✅ indexed | facilitator `facilitator.payai.network` picks up valid x402 challenges |
 | npm `switch402-mcp` | ⏳ 0.1.3 not published | `npm publish` needs user OTP (2FA) — run in `packages/mcp` |
 | mcp.so | 🔲 manual | https://mcp.so/submit — repo URL `AlbertPa00/switch402`; free review or $39 instant+featured |
 | PulseMCP | ⏸ paused | Submissions paused since 2026-09; auto-picks from official registry when back — registry listing covers us |
@@ -69,9 +74,16 @@ Working Python impl: `profit-ops` session 2026-11-24 (`/tmp/x402scan_reg.py`).
 
 ## Gotchas learned
 
-- `com.switch402/switch402` on the registry is an unrelated service at switch402.com
-  (name collision, not impersonation). Consider this for branding/Show HN title.
 - x402scan requires every registered route to be listed in origin `/openapi.json`
   with `x-payment-info` (merged PR #988).
+- x402.org/ecosystem page is SUNSET — foundation now points to x402scan,
+  Agentic.Market, pay.sh, ampersend, x402-list (README of x402-foundation/x402).
+- x402dash probes endpoints with GET — `/v1/chat/completions` now returns the
+  402 challenge on GET for indexability.
+- PayAI Bazaar: listing = automatic on first SETTLED payment; client must echo
+  `extensions.bazaar` in payment payload. `x402_buy.py` (workspace root) now
+  echoes it — needed ~$0.10 USDC on Base + user approval to list all 8.
+- `com.switch402/switch402` on the registry is an unrelated service at switch402.com
+  (name collision, not impersonation). Consider this for branding/Show HN title.
 - Registry description field ≤100 chars.
 - x402scan read APIs are paid; register/verify writes are free with SIWX.
