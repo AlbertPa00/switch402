@@ -277,6 +277,27 @@ export class NanoLedger {
   }
 
   /**
+   * Reinvest collected Platform Treasury fees into the internal Heartbeat Benchmark Buyer
+   * (zero change in total platform assets -> preserves double-entry conservation!).
+   */
+  reinvestTreasuryToBuyer(buyerAgentId, amountNano) {
+    const amt = BigInt(amountNano)
+    if (amt <= 0n || this.treasuryNano < amt) return 0n
+    const acct = this.accounts.get(buyerAgentId)
+    if (!acct) return 0n
+
+    const event = {
+      type: 'REINVEST_TREASURY',
+      ts: Date.now(),
+      agentId: buyerAgentId,
+      amountNano: amt.toString(),
+    }
+    this._applyEvent(event)
+    this._appendWal(event)
+    return amt
+  }
+
+  /**
    * Atomically settle a P2P execution call from a reservation (strictly capped to reservation ceiling).
    */
   settleP2P({
@@ -722,6 +743,14 @@ export class NanoLedger {
         const acct = this.accounts.get(ev.agentId)
         acct.spendableNano -= amt
         this.treasuryNano += amt
+        break
+      }
+
+      case 'REINVEST_TREASURY': {
+        const amt = BigInt(ev.amountNano)
+        const acct = this.accounts.get(ev.agentId)
+        this.treasuryNano -= amt
+        acct.spendableNano += amt
         break
       }
 

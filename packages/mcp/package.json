@@ -1,6 +1,7 @@
 {
   "name": "switch402-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "mcpName": "io.github.AlbertPa00/switch402-mcp",
   "type": "module",
   "license": "MIT",
   "description": "Switch402 Universal Auto-Discovery & Execution MCP Server — gives Claude Code, Cursor, Antigravity, and Codex instant access to P2P inference & x402 capabilities",

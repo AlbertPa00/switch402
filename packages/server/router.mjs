@@ -179,6 +179,13 @@ export class SellerRouter {
       agentId: acct.id,
       registeredCapabilities: Array.from(capsMap.keys()),
     })
+    if (this.onSessionRegistered) {
+      try {
+        this.onSessionRegistered(sessionId)
+      } catch {
+        // ignore hook error
+      }
+    }
     return true
   }
 
