@@ -234,6 +234,10 @@ export function buildOpenApiSpec(origin, marketSnapshot) {
       version: '0.1.3',
       description:
         'High-frequency A2A inference & atomic capability router with Bearer nano-USD ledger, x402 v2 Base USDC, and Lightning settlement.',
+      contact: {
+        name: 'Switch402',
+        url: 'https://github.com/AlbertPa00/switch402',
+      },
       'x-guidance':
         'Read /llms.txt for 3-call autonomous onboarding. Use Authorization: Bearer <ag_live_key> or x402 PAYMENT-SIGNATURE.',
     },
@@ -305,6 +309,7 @@ export function renderDashboardHtml(origin, market, ledgerSummary, recentReceipt
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Switch402 — Stateless Agent Inference & Action Grid</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.ico" />
   <link rel="help" href="/llms.txt" />
   <style>
     :root { --bg:#080c14; --card:#101726; --border:#1e293b; --txt:#e2e8f0; --muted:#94a3b8; --green:#4ade80; --cyan:#38bdf8; --amber:#fbbf24; }
