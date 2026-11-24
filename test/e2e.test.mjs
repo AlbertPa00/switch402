@@ -17,6 +17,10 @@ import {
 } from '../packages/protocol/index.mjs'
 import { createSwitchServer } from '../packages/server/index.mjs'
 import { SwitchWorker } from '../packages/cli/worker.mjs'
+import {
+  parseDuckDuckGoLiteResults,
+  buildTokenReport,
+} from '../packages/server/upstream.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const MCP_BIN = path.join(__dirname, '..', 'packages', 'mcp', 'mcp-server.mjs')
@@ -830,6 +834,97 @@ test('7. Zero-friction onboarding & hardening: 10 free sandbox calls, fail-close
     assert.equal(lbRes.status, 200)
     const lb = await lbRes.json()
     assert.ok(Array.isArray(lb.leaders))
+
+    assert.equal(app.ledger.verifyInvariant().balanced, true)
+  } finally {
+    await app.close()
+  }
+})
+
+test('8. House skills: web.search + chain.token_report pricing, validation & offline parsers', async () => {
+  const app = createSwitchServer({ heartbeatEnabled: false })
+  const { url } = await app.listen(0)
+
+  try {
+    // 8A. New skills advertised in the House book at real-margin buyer prices
+    const market = await (await fetch(`${url}/v1/market`)).json()
+    const search = market.houseFallbackBook.find((x) => x.skill === 'web.search')
+    const report = market.houseFallbackBook.find((x) => x.skill === 'chain.token_report')
+    assert.equal(search.houseBuyerUsd, '0.005500')
+    assert.equal(report.houseBuyerUsd, '0.011000')
+    assert.equal(search.inputSchema.required[0], 'q')
+    assert.equal(report.inputSchema.required[0], 'address')
+
+    // OpenAPI exposes both with the required input as GET query param
+    const openApi = await (await fetch(`${url}/openapi.json`)).json()
+    assert.equal(openApi.paths['/v1/act/web.search'].get.parameters[0].name, 'q')
+    assert.equal(openApi.paths['/v1/act/chain.token_report'].get.parameters[0].name, 'address')
+
+    // 8B. Input validation rejects before touching any upstream — buyer fully refunded
+    const buyer = (await postJson(`${url}/v1/agents/register`, { name: 'val-buyer' })).body
+    app.ledger.deposit({ agentId: buyer.agentId, amountNano: usdToNano('1.00'), txId: 'val-seed' })
+    const spendBefore = app.ledger.getAgent(buyer.agentId).spendableNano
+
+    const badReport = await postJson(
+      `${url}/v1/act/chain.token_report`,
+      { address: 'not-an-address' },
+      { Authorization: `Bearer ${buyer.apiKey}` }
+    )
+    assert.equal(badReport.status, 502)
+    assert.match(badReport.body.error, /requires "address"/)
+
+    const badSearch = await postJson(
+      `${url}/v1/act/web.search`,
+      { q: '   ' },
+      { Authorization: `Bearer ${buyer.apiKey}` }
+    )
+    assert.equal(badSearch.status, 502)
+    assert.match(badSearch.body.error, /requires "q"/)
+    assert.equal(app.ledger.getAgent(buyer.agentId).spendableNano, spendBefore)
+
+    // 8C. DuckDuckGo Lite SERP parser
+    const fixture = `<table>
+      <tr><td><a rel="nofollow" href="https://example.com/one" class='result-link'>First &amp; Result</a></td></tr>
+      <tr><td class='result-snippet'>Snippet <b>one</b> here</td></tr>
+      <tr><td><a rel="nofollow" href="https://example.com/two" class='result-link'>Second Result</a></td></tr>
+      <tr><td class='result-snippet'>Snippet two</td></tr>
+    </table>`
+    const results = parseDuckDuckGoLiteResults(fixture, 8)
+    assert.equal(results.length, 2)
+    assert.equal(results[0].title, 'First & Result')
+    assert.equal(results[0].url, 'https://example.com/one')
+    assert.equal(results[0].snippet, 'Snippet one here')
+    assert.equal(results[1].snippet, 'Snippet two')
+
+    // 8D. Token report risk scoring (pure, no network)
+    const honeypot = buildTokenReport({
+      address: `0x${'a'.repeat(40)}`,
+      token: { isContract: true, bytecodeBytes: 9000, name: 'Scam', symbol: 'SCM', decimals: 18, totalSupplyRaw: '1', owner: '0xbeef' },
+      market: { listed: true, pairCount: 1, liquidityUsd: 4000, topPairs: [] },
+      security: { isHoneypot: true, sellTaxPct: 0.9, top10HolderPct: 0.9, ownerAddress: '0xbeef' },
+      sources: [],
+    })
+    assert.equal(honeypot.riskLevel, 'critical')
+    assert.ok(honeypot.flags.some((f) => f.code === 'honeypot_detected'))
+
+    const clean = buildTokenReport({
+      address: `0x${'b'.repeat(40)}`,
+      token: { isContract: true, bytecodeBytes: 50000, name: 'Good', symbol: 'GOOD', decimals: 6, totalSupplyRaw: '1', owner: null },
+      market: { listed: true, pairCount: 3, liquidityUsd: 5_000_000, topPairs: [] },
+      security: { isHoneypot: false, sellTaxPct: 0, buyTaxPct: 0, isOpenSource: true, top10HolderPct: 0.1, ownerAddress: null },
+      sources: [],
+    })
+    assert.equal(clean.riskLevel, 'low')
+    assert.ok(clean.flags.some((f) => f.code === 'ownership_renounced'))
+
+    const eoa = buildTokenReport({
+      address: `0x${'c'.repeat(40)}`,
+      token: { isContract: false, bytecodeBytes: 0, name: null, symbol: null, decimals: null, totalSupplyRaw: null, owner: null },
+      market: { listed: false, pairCount: 0 },
+      security: { scanned: false },
+      sources: [],
+    })
+    assert.ok(eoa.flags.some((f) => f.code === 'not_a_contract'))
 
     assert.equal(app.ledger.verifyInvariant().balanced, true)
   } finally {

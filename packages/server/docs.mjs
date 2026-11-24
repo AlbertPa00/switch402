@@ -28,7 +28,7 @@ Content-Type: application/json
   OPENAI_API_KEY=ag_live_...
   POST ${origin}/v1/chat/completions {"model": "switch402/instant-test", "messages": [{"role":"user","content":"ping"}]}
 
-- Universal Action Endpoint (e.g. web.fetch_markdown, web.verify_url, util.sha256):
+- Universal Action Endpoint (e.g. web.search, web.fetch_markdown, chain.token_report, web.verify_url, util.sha256):
   POST ${origin}/v1/act/web.fetch_markdown
   Authorization: Bearer ag_live_...
   {"url": "https://example.com"}
@@ -177,14 +177,7 @@ export function buildOpenApiSpec(origin, marketSnapshot) {
       price: { mode: 'fixed', currency: 'USD', amount: priceStr },
       protocols: [{ x402: {} }],
     }
-    const queryParamName =
-      skill === 'web.verify_url' || skill === 'web.fetch_markdown'
-        ? 'url'
-        : skill === 'util.json_validate'
-          ? 'json'
-          : skill === 'util.markdown_clean'
-            ? 'html'
-            : 'text'
+    const queryParamName = item.inputSchema?.required?.[0] || 'text'
     const postSchema = item.inputSchema || {
       type: 'object',
       properties: { [queryParamName]: { type: 'string' } },

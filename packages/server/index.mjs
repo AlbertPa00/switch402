@@ -861,7 +861,7 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
     },
     {
       name: 'act',
-      description: 'Execute an atomic JSON capability (e.g. "web.fetch_markdown", "web.verify_url", "util.sha256").',
+      description: 'Execute an atomic JSON capability (e.g. "web.search", "web.fetch_markdown", "chain.token_report", "web.verify_url", "util.sha256").',
       inputSchema: {
         type: 'object',
         properties: {
@@ -895,7 +895,7 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
       result: {
         protocolVersion: msg.params?.protocolVersion || '2025-03-26',
         capabilities: { tools: {}, resources: {} },
-        serverInfo: { name: 'switch402-remote-mcp', version: '0.1.2' },
+        serverInfo: { name: 'switch402-remote-mcp', version: '0.1.3' },
       },
     })
     return

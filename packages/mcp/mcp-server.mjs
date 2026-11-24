@@ -115,7 +115,7 @@ const TOOLS = [
       properties: {
         skill: {
           type: 'string',
-          description: 'Skill identifier without act: prefix (e.g. "web.fetch_markdown", "web.verify_url", "util.sha256")',
+          description: 'Skill identifier without act: prefix (e.g. "web.search", "web.fetch_markdown", "chain.token_report", "web.verify_url", "util.sha256")',
         },
         input: {
           type: 'object',
@@ -359,7 +359,7 @@ async function handleRpcMessage(msg) {
         result: {
           protocolVersion: msg.params?.protocolVersion || '2024-11-05',
           capabilities: { tools: {}, resources: {} },
-          serverInfo: { name: 'switch402-mcp', version: '0.1.2' },
+          serverInfo: { name: 'switch402-mcp', version: '0.1.3' },
         },
       })
       return

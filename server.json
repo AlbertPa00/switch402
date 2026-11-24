@@ -1,15 +1,15 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
   "name": "io.github.AlbertPa00/switch402-mcp",
-  "description": "Universal MCP gateway to Switch402 P2P inference & x402 capabilities",
-  "version": "0.1.2",
+  "description": "x402 P2P grid: keyless LLM inference, web search & Base token safety reports",
+  "version": "0.1.3",
   "title": "Switch402",
   "websiteUrl": "https://switch402.fly.dev",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "switch402-mcp",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "transport": {
         "type": "stdio"
       },
