@@ -231,12 +231,28 @@ export function buildOpenApiSpec(origin, marketSnapshot) {
     openapi: '3.1.0',
     info: {
       title: 'Switch402 — Stateless Agent Inference & Action Switch',
-      version: '0.1.0',
+      version: '0.1.3',
       description:
         'High-frequency A2A inference & atomic capability router with Bearer nano-USD ledger, x402 v2 Base USDC, and Lightning settlement.',
       'x-guidance':
         'Read /llms.txt for 3-call autonomous onboarding. Use Authorization: Bearer <ag_live_key> or x402 PAYMENT-SIGNATURE.',
     },
+    components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: 'http',
+          scheme: 'bearer',
+          description: 'Switch402 agent API key (ag_live_*) — register free at POST /v1/agents/register',
+        },
+        x402PaymentSignature: {
+          type: 'apiKey',
+          in: 'header',
+          name: 'PAYMENT-SIGNATURE',
+          description: 'x402 v2 payment signature — keyless per-call USDC on Base (eip155:8453)',
+        },
+      },
+    },
+    security: [{ bearerAuth: [] }, { x402PaymentSignature: [] }],
     paths,
   }
 }

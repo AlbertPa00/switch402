@@ -220,6 +220,7 @@ async function handleHttpRequest(req, res, ctx) {
       .map((x) => `${origin}/v1/act/${x.skill}`)
     sendJson(res, 200, {
       x402Version: 2,
+      version: 1,
       openapi: `${origin}/openapi.json`,
       facilitator: payments.facilitatorUrl,
       payTo: payments.payToEvm,
@@ -605,6 +606,7 @@ async function handleHttpRequest(req, res, ctx) {
       capabilityName: skill,
       method,
       reserveNano,
+      inputSchema: house.skillMeta?.[skill]?.inputSchema || null,
     })
     if (!authResult) return
 
@@ -678,6 +680,7 @@ async function resolveBuyerAndReserve({
   capabilityName,
   method,
   reserveNano,
+  inputSchema = null,
 }) {
   // Round x402 challenge up to nearest whole USDC atomic unit (1,000 nanoUSD = $0.000001)
   const challengeNano =
@@ -688,6 +691,7 @@ async function resolveBuyerAndReserve({
     name: capabilityName,
     method,
     requiredNano: challengeNano,
+    inputSchema,
   })
 
   const agent = authenticateBearer(req, ledger)

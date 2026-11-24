@@ -98,7 +98,11 @@ export class PaymentEngine {
     const upperMethod = String(method || 'GET').toUpperCase()
 
     const resolvedInput =
-      inputSchema ||
+      (inputSchema && upperMethod === 'GET'
+        ? { type: 'object', properties: { queryParams: inputSchema } }
+        : inputSchema
+          ? { type: 'object', properties: { body: inputSchema } }
+          : null) ||
       (upperMethod === 'GET'
         ? {
             type: 'object',
