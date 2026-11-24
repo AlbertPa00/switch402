@@ -442,6 +442,21 @@ async function handleHttpRequest(req, res, ctx) {
     return
   }
 
+  // Discovery probes (x402dash et al.) issue GET — answer with the POST challenge so the
+  // endpoint registers as a valid x402 resource instead of a bare 404.
+  if (method === 'GET' && pathname === '/v1/chat/completions') {
+    const reserveNano = router.estimateBuyerReserveNano('llm:switch402/instant-test', {})
+    const challengeNano = reserveNano < 1_000n ? 1_000n : ((reserveNano + 999n) / 1000n) * 1000n
+    const challenge = payments.buildX402Challenge({
+      pathAndQuery: pathname + url.search,
+      name: 'chat_switch402/instant-test',
+      method: 'POST',
+      requiredNano: challengeNano,
+    })
+    sendJson(res, 402, challenge.body, challenge.headers)
+    return
+  }
+
   // 4. OpenAI-Compatible Inference Endpoint (`POST /v1/chat/completions`)
   if (method === 'POST' && pathname === '/v1/chat/completions') {
     const body = await readJsonBody(req)
