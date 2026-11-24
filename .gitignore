@@ -2,6 +2,6 @@ node_modules/
 data/
 .env
 *.log
+*.tgz
 .DS_Store
 Thumbs.db
-npm-debug.log*
