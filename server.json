@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
   "name": "io.github.albertpa00/switch402-mcp",
-  "description": "Switch402 Universal Auto-Discovery & Execution MCP Server — instant access to P2P inference & x402 capabilities",
+  "description": "Universal MCP gateway to Switch402 P2P inference & x402 capabilities",
   "version": "0.1.0",
   "title": "Switch402",
   "websiteUrl": "https://switch402.fly.dev",
