@@ -1,5 +1,7 @@
 # Switch402 — Stateless Agent Inference & Action Switch
 
+[![AlbertPa00/switch402 MCP server](https://glama.ai/mcp/servers/AlbertPa00/switch402/badges/score.svg)](https://glama.ai/mcp/servers/AlbertPa00/switch402)
+
 **Zero-dependency Node.js ESM (`>=18`) high-throughput A2A execution switch:**
 - **Drop-In OpenAI Inference (`/v1/chat/completions`, `/v1/models`)** + **Universal Atomic Capabilities (`/v1/act/:skill`)**
 - **Keyless x402 per-call payment**: an agent holding $0.01 USDC on Base hits any capability with **zero account signup, zero API key, zero KYC** — receive `HTTP 402`, sign `PAYMENT-SIGNATURE`, get the result.
