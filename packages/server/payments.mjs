@@ -352,8 +352,13 @@ export class PaymentEngine {
     const acct = this.ledger.getAgent(agentId)
     if (!acct) throw new Error(`Unknown agent: ${agentId}`)
     const usdNum = Number(amountUsd)
-    if (!Number.isFinite(usdNum) || usdNum < 0.01 || usdNum > 10_000) {
-      throw new Error('amountUsd must be between 0.01 and 10000')
+    if (!Number.isFinite(usdNum) || usdNum < 0.005 || usdNum > 10_000) {
+      throw new Error('amountUsd must be between 0.005 and 10000')
+    }
+    if (process.env.NODE_ENV === 'production' && !this.coinosApiToken && !this.webhookSecret) {
+      throw new Error(
+        'Lightning deposit rail is not configured on this server yet (use Base USDC x402 or set COINOS_API_TOKEN)'
+      )
     }
 
     const btcRate = await this.getBtcUsdRate()
@@ -362,6 +367,7 @@ export class PaymentEngine {
     const invoiceId = `lninv_${randomBytes(8).toString('hex')}`
 
     let bolt11 = `lnbc${sats}n1p_switch402_${invoiceId}`
+    let paymentHash = null
     if (this.coinosApiToken) {
       const resp = await fetch(`${this.coinosApiUrl}/invoice`, {
         method: 'POST',
@@ -383,7 +389,8 @@ export class PaymentEngine {
         throw new Error(`Coinos invoice error: HTTP ${resp.status}`)
       }
       const data = await resp.json()
-      bolt11 = data.text || data.hash || bolt11
+      bolt11 = data.text || data.bolt11 || data.hash || bolt11
+      paymentHash = data.hash || data.id || null
     }
 
     this.pendingInvoices.set(invoiceId, {
@@ -392,6 +399,7 @@ export class PaymentEngine {
       sats,
       creditNano,
       bolt11,
+      paymentHash,
       createdAt: Date.now(),
       settled: false,
     })
@@ -402,8 +410,116 @@ export class PaymentEngine {
       sats,
       creditUsd: nanoToUsd(creditNano, 4),
       bolt11,
+      verifyUrl: `${this.publicOrigin}/v1/wallet/deposit/lightning/verify`,
       expiresInSeconds: 900,
     }
+  }
+
+  /**
+   * Pull-verify a pending Lightning invoice directly against Coinos API (`GET /invoice/:hash`)
+   * so agents & MCP clients get instant settlement without relying on custom webhook headers.
+   */
+  async verifyLightningDeposit({ invoiceId, agentId = null }) {
+    const inv = this.pendingInvoices.get(String(invoiceId || ''))
+    if (!inv) {
+      const err = new Error(`Unknown or expired invoiceId: ${invoiceId}`)
+      err.statusCode = 404
+      throw err
+    }
+    if (agentId && inv.agentId !== agentId) {
+      const err = new Error('Invoice belongs to a different agent')
+      err.statusCode = 403
+      throw err
+    }
+    if (inv.settled) {
+      return {
+        ok: true,
+        settled: true,
+        alreadyCredited: true,
+        invoiceId: inv.invoiceId,
+        agentId: inv.agentId,
+        creditedUsd: nanoToUsd(inv.creditNano, 4),
+        account: this.ledger.serializeAccount(inv.agentId),
+      }
+    }
+    if (!this.coinosApiToken) {
+      return {
+        ok: true,
+        settled: false,
+        invoiceId: inv.invoiceId,
+        sats: inv.sats,
+        hint: 'Awaiting settlement confirmation',
+      }
+    }
+
+    const lookupKey = inv.paymentHash || inv.bolt11
+    const resp = await fetch(`${this.coinosApiUrl}/invoice/${encodeURIComponent(lookupKey)}`, {
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${this.coinosApiToken}`,
+      },
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!resp.ok) {
+      throw new Error(`Coinos invoice lookup HTTP ${resp.status}`)
+    }
+    const data = await resp.json()
+    const isPaid = Boolean(
+      data?.confirmed === true ||
+        data?.state === 'SETTLED' ||
+        (Number(data?.received || 0) >= inv.sats && inv.sats > 0)
+    )
+    if (!isPaid) {
+      return {
+        ok: true,
+        settled: false,
+        invoiceId: inv.invoiceId,
+        sats: inv.sats,
+        bolt11: inv.bolt11,
+      }
+    }
+
+    inv.settled = true
+    const txId = `lightning:${data?.hash || inv.paymentHash || inv.invoiceId}`
+    const dep = this.ledger.deposit({
+      agentId: inv.agentId,
+      amountNano: inv.creditNano,
+      rail: 'lightning',
+      txId,
+    })
+
+    return {
+      ok: true,
+      settled: true,
+      duplicate: dep.duplicate,
+      invoiceId: inv.invoiceId,
+      agentId: inv.agentId,
+      creditedUsd: nanoToUsd(inv.creditNano, 4),
+      account: this.ledger.serializeAccount(inv.agentId),
+    }
+  }
+
+  /**
+   * Handle unauthenticated Coinos payment notification by pull-verifying against Coinos HTTPS API.
+   */
+  async handleCoinosNotification(payload = {}) {
+    if (!this.coinosApiToken) return null
+    const memoStr = String(payload?.memo || payload?.invoice?.memo || '')
+    const hashStr = String(payload?.hash || payload?.paymentHash || payload?.invoice?.hash || '')
+    let matchedId = null
+    const memoMatch = memoStr.match(/\((lninv_[0-9a-f]+)\)/i)
+    if (memoMatch && this.pendingInvoices.has(memoMatch[1])) {
+      matchedId = memoMatch[1]
+    } else if (hashStr) {
+      for (const [id, inv] of this.pendingInvoices.entries()) {
+        if (inv.paymentHash === hashStr || inv.bolt11 === hashStr) {
+          matchedId = id
+          break
+        }
+      }
+    }
+    if (!matchedId) return null
+    return this.verifyLightningDeposit({ invoiceId: matchedId })
   }
 
   /**

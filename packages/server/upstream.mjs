@@ -128,6 +128,9 @@ export class HouseUpstream {
       'web.fetch_markdown': '0.0050',
       'web.search': '0.0050',
       'chain.token_report': '0.0100',
+      'market.quote': '0.0005',
+      'trade.signal': '0.0015',
+      'trade.notarize': '0.0005',
     }
 
     this.skillMeta = {
@@ -159,7 +162,7 @@ export class HouseUpstream {
         example: { html: '<h1>Hello</h1><p>World</p>' },
       },
       'web.verify_url': {
-        description: 'SSRF-safe HTTP notary: fetch public URL and return status, byte length, SHA-256, and UTC timestamp',
+        description: 'SSRF-safe HTTP notary: fetch public URL and return status, byte length, SHA-256, UTC timestamp, and signed receipt URL',
         inputSchema: {
           type: 'object',
           properties: { url: { type: 'string', description: 'Public http(s) URL to notarize' } },
@@ -201,6 +204,44 @@ export class HouseUpstream {
           required: ['address'],
         },
         example: { address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' },
+      },
+      'market.quote': {
+        description: 'Sub-second multi-venue crypto spot ticker (Binance Vision + Coinbase): mid price, best bid/ask, spread bps, and 24h volume/change',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            symbol: { type: 'string', description: 'Asset ticker or pair (e.g. "BTC", "ETH-USD", "SOLUSDT")' },
+          },
+          required: ['symbol'],
+        },
+        example: { symbol: 'BTC-USD' },
+      },
+      'trade.signal': {
+        description: 'Sub-second quantitative regime & trade signal engine (EMA-9/21, RSI-14, ATR%, Bollinger %B) from live OHLCV klines or deterministic candles array',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            symbol: { type: 'string', description: 'Asset ticker or pair (e.g. "ETH-USD", "BTC", "SOL")' },
+            interval: { type: 'string', description: 'Candle interval: "1m", "5m", "15m", "1h", "4h", "1d" (default "5m")' },
+            candles: {
+              type: 'array',
+              description: 'Optional deterministic close/OHLC array (min 22 items) for offline evaluation & canary verification',
+            },
+          },
+        },
+        example: { symbol: 'ETH-USD', interval: '5m' },
+      },
+      'trade.notarize': {
+        description: 'Cryptographic pre-trade / bounty commitment notary: canonical JSON SHA-256 digest + UTC timestamp + verifiable Switch402 receipt',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            payload: { description: 'Decision object or string payload to commit and timestamp' },
+            note: { type: 'string', description: 'Optional context label (e.g. strategy ID or bounty task ID)' },
+          },
+          required: ['payload'],
+        },
+        example: { payload: { symbol: 'ETH-USD', action: 'buy', price: 3120.5 }, note: 'arb-v1' },
       },
     }
 
@@ -263,6 +304,16 @@ export class HouseUpstream {
   canFulfill(capability) {
     if (capability === 'llm:switch402/instant-test') return true
     if (capability.startsWith('llm:')) return Boolean(this.upstreamUrl && this.upstreamKey)
+    const skill = capability.startsWith('act:') ? capability.slice(4) : capability
+    return Object.prototype.hasOwnProperty.call(this.skillWholesaleUsd, skill)
+  }
+
+  /**
+   * Zero-marginal-cost capabilities eligible for registered-agent free starter sandbox calls.
+   */
+  isSandboxEligible(capability) {
+    if (capability === 'llm:switch402/instant-test') return true
+    if (capability.startsWith('llm:')) return false
     const skill = capability.startsWith('act:') ? capability.slice(4) : capability
     return Object.prototype.hasOwnProperty.call(this.skillWholesaleUsd, skill)
   }
@@ -511,6 +562,59 @@ export class HouseUpstream {
         }
         const report = await fetchBaseTokenReport(address.toLowerCase())
         return { wholesaleNano, output: report }
+      }
+
+      case 'market.quote': {
+        const rawSym = String(input.symbol ?? input.pair ?? '').trim()
+        if (!rawSym) {
+          throw new Error('market.quote requires "symbol" (e.g. "BTC", "ETH-USD", "SOLUSDT")')
+        }
+        const quote = await fetchMultiVenueQuote(rawSym)
+        return { wholesaleNano, output: quote }
+      }
+
+      case 'trade.signal': {
+        if (Array.isArray(input.candles)) {
+          const sig = computeTradeSignalFromCandles(input.candles, {
+            symbol: String(input.symbol || 'CUSTOM'),
+            interval: String(input.interval || 'custom'),
+            source: 'deterministic_candles',
+          })
+          return { wholesaleNano, output: sig }
+        }
+        const rawSym = String(input.symbol ?? input.pair ?? '').trim()
+        if (!rawSym) {
+          throw new Error(
+            'trade.signal requires either "symbol" (e.g. "ETH-USD") or a deterministic "candles" array'
+          )
+        }
+        const interval = normalizeCandleInterval(input.interval)
+        const { candles, source, normalizedSymbol } = await fetchMarketCandles(rawSym, interval)
+        const sig = computeTradeSignalFromCandles(candles, {
+          symbol: normalizedSymbol,
+          interval,
+          source,
+        })
+        return { wholesaleNano, output: sig }
+      }
+
+      case 'trade.notarize': {
+        if (input.payload === undefined || input.payload === null || input.payload === '') {
+          throw new Error('trade.notarize requires a non-empty "payload" object or string')
+        }
+        const canonical =
+          typeof input.payload === 'string' ? input.payload : canonicalJsonString(input.payload)
+        const sha256 = createHash('sha256').update(canonical, 'utf8').digest('hex')
+        return {
+          wholesaleNano,
+          output: {
+            sha256,
+            bytes: Buffer.byteLength(canonical, 'utf8'),
+            canonicalPayload: canonical.length <= 4096 ? canonical : `${canonical.slice(0, 4096)}...[truncated]`,
+            note: input.note ? String(input.note).slice(0, 240) : null,
+            notarizedUtc: new Date().toISOString(),
+          },
+        }
       }
 
       default:
@@ -962,4 +1066,369 @@ export function buildTokenReport({ address, token, market, security, sources }) 
 
 function pct100(frac) {
   return `${Math.round(Number(frac) * 10000) / 100}%`
+}
+
+/**
+ * Deterministic recursive key-sorted JSON serializer for commitment notarization.
+ */
+export function canonicalJsonString(val) {
+  if (val === null || typeof val !== 'object') return JSON.stringify(val)
+  if (Array.isArray(val)) return `[${val.map((v) => canonicalJsonString(v)).join(',')}]`
+  const keys = Object.keys(val).sort()
+  return `{${keys
+    .filter((k) => val[k] !== undefined)
+    .map((k) => `${JSON.stringify(k)}:${canonicalJsonString(val[k])}`)
+    .join(',')}}`
+}
+
+/**
+ * Normalize flexible ticker inputs ("BTC", "eth-usd", "SOL/USDT", "SOLUSDT") into venue pairs.
+ */
+export function normalizeMarketSymbol(raw) {
+  const cleaned = String(raw || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9/-]/g, '')
+  if (!cleaned || cleaned.length > 20) {
+    throw new Error(`Invalid market symbol: "${raw}"`)
+  }
+  let base = cleaned
+  let quote = 'USD'
+  if (cleaned.includes('-') || cleaned.includes('/')) {
+    const [b, q] = cleaned.split(/[-/]/)
+    base = b
+    quote = q === 'USDT' || q === 'USDC' || !q ? 'USD' : q
+  } else if (cleaned.endsWith('USDT') && cleaned.length > 4) {
+    base = cleaned.slice(0, -4)
+    quote = 'USD'
+  } else if (cleaned.endsWith('USDC') && cleaned.length > 4) {
+    base = cleaned.slice(0, -4)
+    quote = 'USD'
+  } else if (cleaned.endsWith('USD') && cleaned.length > 3) {
+    base = cleaned.slice(0, -3)
+    quote = 'USD'
+  }
+  if (!/^[A-Z0-9]{2,12}$/.test(base)) {
+    throw new Error(`Invalid base asset in symbol: "${raw}"`)
+  }
+  const binanceQuote = quote === 'USD' ? 'USDT' : quote
+  return {
+    normalized: `${base}-${quote}`,
+    base,
+    quote,
+    binanceSymbol: `${base}${binanceQuote}`,
+    coinbaseProduct: `${base}-${quote === 'USDT' ? 'USD' : quote}`,
+  }
+}
+
+/**
+ * US-datacenter-safe (`iad`) multi-venue ticker fanout (`data-api.binance.vision` + Coinbase Exchange).
+ */
+export async function fetchMultiVenueQuote(rawSymbol) {
+  const sym = normalizeMarketSymbol(rawSymbol)
+
+  const [bRes, cRes] = await Promise.all([
+    timedSource('binance_vision', async () => {
+      const r = await fetch(
+        `https://data-api.binance.vision/api/v3/ticker/24hr?symbol=${encodeURIComponent(sym.binanceSymbol)}`,
+        { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(6_000) }
+      )
+      if (!r.ok) throw new Error(`Binance Vision HTTP ${r.status}`)
+      const j = await r.json()
+      const bid = Number(j.bidPrice)
+      const ask = Number(j.askPrice)
+      const last = Number(j.lastPrice)
+      if (!Number.isFinite(last) || last <= 0) throw new Error('Invalid Binance price')
+      return {
+        venue: 'binance_vision',
+        last,
+        bid: bid > 0 ? bid : last,
+        ask: ask > 0 ? ask : last,
+        change24hPct: Number(j.priceChangePercent || 0),
+        volume24hUsd: Number(j.quoteVolume || 0),
+      }
+    }),
+    timedSource('coinbase', async () => {
+      const r = await fetch(
+        `https://api.exchange.coinbase.com/products/${encodeURIComponent(sym.coinbaseProduct)}/ticker`,
+        {
+          headers: { Accept: 'application/json', 'User-Agent': 'Switch402-Market/1.0' },
+          signal: AbortSignal.timeout(6_000),
+        }
+      )
+      if (!r.ok) throw new Error(`Coinbase HTTP ${r.status}`)
+      const j = await r.json()
+      const last = Number(j.price)
+      const bid = Number(j.bid || last)
+      const ask = Number(j.ask || last)
+      const volBase = Number(j.volume || 0)
+      if (!Number.isFinite(last) || last <= 0) throw new Error('Invalid Coinbase price')
+      return {
+        venue: 'coinbase',
+        last,
+        bid,
+        ask,
+        change24hPct: null,
+        volume24hUsd: Math.round(volBase * last * 100) / 100,
+      }
+    }),
+  ])
+
+  const active = [bRes, cRes].filter((x) => x.ok).map((x) => ({ ...x.data, rttMs: x.ms }))
+  if (active.length === 0) {
+    throw new Error(`No venue quote for ${sym.normalized}: ${bRes.error}; ${cRes.error}`)
+  }
+
+  const bestBid = Math.max(...active.map((v) => v.bid))
+  const bestAsk = Math.min(...active.map((v) => v.ask))
+  const avgMid = active.reduce((s, v) => s + (v.bid + v.ask) / 2, 0) / active.length
+  const midUsd = Number(avgMid.toPrecision(8))
+  const rawSpread = bestAsk >= bestBid ? bestAsk - bestBid : Math.abs(active[0].ask - active[0].bid)
+  const spreadBps = Math.round(((rawSpread / midUsd) * 10_000) * 100) / 100
+  const changeSource = active.find((v) => v.change24hPct !== null)
+
+  return {
+    symbol: sym.normalized,
+    base: sym.base,
+    quote: sym.quote,
+    midUsd,
+    bestBid: Number(bestBid.toPrecision(8)),
+    bestAsk: Number(bestAsk.toPrecision(8)),
+    spreadBps,
+    change24hPct: changeSource ? changeSource.change24hPct : null,
+    volume24hUsd: Math.round(active.reduce((s, v) => s + (v.volume24hUsd || 0), 0)),
+    venueCount: active.length,
+    venues: active,
+    fetchedUtc: new Date().toISOString(),
+  }
+}
+
+export function normalizeCandleInterval(raw) {
+  const allowed = new Set(['1m', '5m', '15m', '1h', '4h', '1d'])
+  const v = String(raw || '5m').trim().toLowerCase()
+  if (!allowed.has(v)) {
+    throw new Error(`Unsupported interval "${raw}". Allowed: 1m, 5m, 15m, 1h, 4h, 1d`)
+  }
+  return v
+}
+
+async function fetchMarketCandles(rawSymbol, interval) {
+  const sym = normalizeMarketSymbol(rawSymbol)
+
+  try {
+    const r = await fetch(
+      `https://data-api.binance.vision/api/v3/klines?symbol=${encodeURIComponent(sym.binanceSymbol)}&interval=${interval}&limit=60`,
+      { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(7_000) }
+    )
+    if (r.ok) {
+      const rows = await r.json()
+      if (Array.isArray(rows) && rows.length >= 22) {
+        const candles = rows.map((k) => ({
+          ts: Number(k[0]),
+          open: Number(k[1]),
+          high: Number(k[2]),
+          low: Number(k[3]),
+          close: Number(k[4]),
+          volume: Number(k[5]),
+        }))
+        return { candles, source: 'binance_vision', normalizedSymbol: sym.normalized }
+      }
+    }
+  } catch {
+    // Fall back to Coinbase Exchange public candles
+  }
+
+  const granMap = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 }
+  const gran = granMap[interval] || 300
+  const cb = await fetch(
+    `https://api.exchange.coinbase.com/products/${encodeURIComponent(sym.coinbaseProduct)}/candles?granularity=${gran}`,
+    {
+      headers: { Accept: 'application/json', 'User-Agent': 'Switch402-Market/1.0' },
+      signal: AbortSignal.timeout(7_000),
+    }
+  )
+  if (!cb.ok) {
+    throw new Error(`Failed to fetch OHLCV klines for ${sym.normalized} (HTTP ${cb.status})`)
+  }
+  const cbRows = await cb.json()
+  if (!Array.isArray(cbRows) || cbRows.length < 22) {
+    throw new Error(`Insufficient candle history for ${sym.normalized}`)
+  }
+  // Coinbase returns newest-first: [time, low, high, open, close, volume]
+  const sorted = cbRows
+    .slice(0, 60)
+    .reverse()
+    .map((k) => ({
+      ts: Number(k[0]) * 1000,
+      low: Number(k[1]),
+      high: Number(k[2]),
+      open: Number(k[3]),
+      close: Number(k[4]),
+      volume: Number(k[5]),
+    }))
+  return { candles: sorted, source: 'coinbase', normalizedSymbol: sym.normalized }
+}
+
+/**
+ * Pure deterministic quantitative indicator & signal engine (offline-testable & P2P canary-verifiable).
+ */
+export function computeTradeSignalFromCandles(rawCandles, meta = {}) {
+  if (!Array.isArray(rawCandles) || rawCandles.length < 22) {
+    throw new Error('trade.signal requires at least 22 candles')
+  }
+
+  const candles = rawCandles.map((c) => {
+    if (typeof c === 'number') {
+      if (!Number.isFinite(c) || c <= 0) throw new Error('Candle close values must be positive numbers')
+      return { open: c, high: c, low: c, close: c, volume: 0 }
+    }
+    const close = Number(c?.close ?? c?.c)
+    if (!Number.isFinite(close) || close <= 0) {
+      throw new Error('Each candle object requires a positive numeric "close"')
+    }
+    return {
+      open: Number(c.open ?? c.o ?? close),
+      high: Number(c.high ?? c.h ?? close),
+      low: Number(c.low ?? c.l ?? close),
+      close,
+      volume: Number(c.volume ?? c.v ?? 0),
+    }
+  })
+
+  const closes = candles.map((c) => c.close)
+  const price = closes[closes.length - 1]
+  const ema9 = calcEma(closes, 9)
+  const ema21 = calcEma(closes, 21)
+  const rsi14 = calcRsi(closes, 14)
+  const atr14 = calcAtr(candles, 14)
+  const atr14Pct = (atr14 / price) * 100
+
+  const window20 = closes.slice(-20)
+  const sma20 = window20.reduce((s, v) => s + v, 0) / window20.length
+  const variance = window20.reduce((s, v) => s + (v - sma20) ** 2, 0) / window20.length
+  const std20 = Math.sqrt(variance)
+  const upperBand = sma20 + 2 * std20
+  const lowerBand = sma20 - 2 * std20
+  const bollingerPctB = upperBand > lowerBand ? (price - lowerBand) / (upperBand - lowerBand) : 0.5
+
+  const lookbackIdx = Math.max(0, closes.length - 11)
+  const momentum10Pct = ((price - closes[lookbackIdx]) / closes[lookbackIdx]) * 100
+  const emaSpreadBps = ((ema9 - ema21) / ema21) * 10_000
+
+  let score = 0
+  const rationale = []
+
+  if (emaSpreadBps > 12) {
+    score += 1.2
+    rationale.push(`EMA9 > EMA21 (+${emaSpreadBps.toFixed(1)} bps bullish trend)`)
+  } else if (emaSpreadBps < -12) {
+    score -= 1.2
+    rationale.push(`EMA9 < EMA21 (${emaSpreadBps.toFixed(1)} bps bearish trend)`)
+  }
+
+  if (rsi14 < 30) {
+    score += 1.4
+    rationale.push(`RSI14 oversold (${rsi14.toFixed(1)} < 30)`)
+  } else if (rsi14 > 70) {
+    score -= 1.4
+    rationale.push(`RSI14 overbought (${rsi14.toFixed(1)} > 70)`)
+  } else if (rsi14 >= 54 && emaSpreadBps > 0) {
+    score += 0.6
+    rationale.push(`Constructive bullish momentum (RSI14 ${rsi14.toFixed(1)})`)
+  } else if (rsi14 <= 46 && emaSpreadBps < 0) {
+    score -= 0.6
+    rationale.push(`Negative momentum confirmation (RSI14 ${rsi14.toFixed(1)})`)
+  }
+
+  if (bollingerPctB < 0.08) {
+    score += 0.7
+    rationale.push(`Price near lower 2-sigma Bollinger band (%B=${bollingerPctB.toFixed(2)})`)
+  } else if (bollingerPctB > 0.92) {
+    score -= 0.7
+    rationale.push(`Price stretched above upper 2-sigma Bollinger band (%B=${bollingerPctB.toFixed(2)})`)
+  }
+
+  let regime = 'range'
+  if (rsi14 < 30) regime = 'oversold_bounce'
+  else if (rsi14 > 70) regime = 'overbought_fade'
+  else if (emaSpreadBps > 20) regime = 'trend_up'
+  else if (emaSpreadBps < -20) regime = 'trend_down'
+
+  let action = 'hold'
+  if (score >= 1.1) action = 'buy'
+  else if (score <= -1.1) action = 'sell'
+
+  const confidence = Math.round(Math.min(0.95, Math.max(0.15, Math.abs(score) / 2.8)) * 1000) / 1000
+  if (rationale.length === 0) {
+    rationale.push('Neutral consolidation inside EMA/RSI equilibrium band')
+  }
+
+  return {
+    symbol: meta.symbol || 'CUSTOM',
+    interval: meta.interval || 'custom',
+    source: meta.source || 'deterministic_candles',
+    candleCount: candles.length,
+    action,
+    regime,
+    confidence,
+    indicators: {
+      price: roundSig(price),
+      ema9: roundSig(ema9),
+      ema21: roundSig(ema21),
+      emaSpreadBps: Math.round(emaSpreadBps * 100) / 100,
+      rsi14: Math.round(rsi14 * 100) / 100,
+      atr14Pct: Math.round(atr14Pct * 1000) / 1000,
+      bollingerPctB: Math.round(bollingerPctB * 1000) / 1000,
+      momentum10Pct: Math.round(momentum10Pct * 1000) / 1000,
+    },
+    rationale,
+  }
+}
+
+function calcEma(values, period) {
+  const k = 2 / (period + 1)
+  let ema = values.slice(0, period).reduce((s, v) => s + v, 0) / period
+  for (let i = period; i < values.length; i++) {
+    ema = values[i] * k + ema * (1 - k)
+  }
+  return ema
+}
+
+function calcRsi(values, period = 14) {
+  let avgGain = 0
+  let avgLoss = 0
+  for (let i = 1; i <= period; i++) {
+    const diff = values[i] - values[i - 1]
+    if (diff >= 0) avgGain += diff
+    else avgLoss -= diff
+  }
+  avgGain /= period
+  avgLoss /= period
+  for (let i = period + 1; i < values.length; i++) {
+    const diff = values[i] - values[i - 1]
+    const gain = diff > 0 ? diff : 0
+    const loss = diff < 0 ? -diff : 0
+    avgGain = (avgGain * (period - 1) + gain) / period
+    avgLoss = (avgLoss * (period - 1) + loss) / period
+  }
+  if (avgLoss === 0) return 100
+  const rs = avgGain / avgLoss
+  return 100 - 100 / (1 + rs)
+}
+
+function calcAtr(candles, period = 14) {
+  const trs = []
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i]
+    const prevClose = candles[i - 1].close
+    const tr = Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose))
+    trs.push(tr)
+  }
+  if (trs.length === 0) return 0
+  const slice = trs.slice(-period)
+  return slice.reduce((s, v) => s + v, 0) / slice.length
+}
+
+function roundSig(n) {
+  return Number(Number(n).toPrecision(8))
 }

@@ -7,10 +7,12 @@ Long-term userbase growth ops log. Update the status column as items land.
 | Channel | Status | Notes |
 |---|---|---|
 | x402scan (Merit Systems) | ✅ LIVE | All 8 resources registered 2026-11-24. Server page: https://www.x402scan.com/server/d1b06f8b-03cf-4c10-87fa-f8d6db630ef9 |
-| x402dash | 🟡 5/8 | Registered via `POST api.x402dash.com/v1/register` (free, 5/hr). chat/completions + 2 util.* pending — re-run after rate limit |
-| PayAI Bazaar | 🔲 needs settlement | Listing is automatic on first SETTLED payment per resource — client MUST echo `extensions.bazaar` in the payment payload (x402_buy.py now does). Fund Base wallet ~$0.10 USDC → run `python ../x402_buy.py` |
+| x402dash | ✅ 8/8 | All endpoints registered+verified 2026-11-25 via `POST api.x402dash.com/v1/register` |
+| PayAI Bazaar | 🔲 needs settlement | Confirmed NOT indexed (scanned all 19k resources by payTo 2026-11-25). Server already injects `extensions.bazaar` into facilitator calls (payments.mjs:228) — but indexing needs a settled payment whose payload carries it. `python ../x402_buy.py` with ~$0.10 USDC on Base lists all 8. |
 | Agentic.Market (Coinbase) | 🔲 curated | No public submit; indexes from facilitator catalogs. Get Bazaar-listed first |
-| x402-list.com | 🔲 $1 fee | Free submit `POST /api/v1/submit` BUT fly.dev likely counts as free-compute host → one-off $1 USDC. NOTE: unrelated `api.switch402.com` service already listed there under "switch402" |
+| x402-list.com | 🔲 $1 fee | CONFIRMED 2026-11-25: fly.dev = free-compute host → $1 USDC x402 payment to enter review queue (non-refundable, buys review not listing). NOTE: unrelated `api.switch402.com` service already listed there under "switch402" |
+| SarnAI board | ✅ LIVE | Listed as "Switch402 - x402 payment switch for agents" — searchable, health passing. `register_me`/`check_listing` MCP tools at board.sarnai.dev/mcp for future services |
+| ClawWork | ✅ LIVE | 4 service offers posted (x402 utilities/token/trade signals); agent `switch402` id e3326979-5a9c-41be-aa7b-dfa0c74903ce. New-account offers don't render publicly until moderation |
 | pay.sh registry | ❌ n/a | Solana-foundation MPP gateway stack (`pay` CLI) — catalogs provider gateways, not external x402 endpoints. Revisit only if we run an MPP gateway |
 | app.ampersend.ai | 🔲 account | Marketplace behind sign-in — human step |
 | Official MCP Registry | ✅ LIVE | `dev.fly.switch402/switch402` v0.1.3 published via HTTP (Ed25519) auth, remotes → `switch402.fly.dev/mcp`. Auto-feeds PulseMCP + Glama. |
@@ -90,3 +92,14 @@ Working Python impl: `profit-ops` session 2026-11-24 (`/tmp/x402scan_reg.py`).
   (name collision, not impersonation). Consider this for branding/Show HN title.
 - Registry description field ≤100 chars.
 - x402scan read APIs are paid; register/verify writes are free with SIWX.
+
+## 2026-11-25 ~10:25Z — PR wave 2 + YourAITools gateway
+- PR michielpost/x402-dev#330 — Projects.md services section (verified commit via GraphQL)
+- PR xpaysh/awesome-mcp-monetization#31 — Platforms and Services (verified)
+- PR eltociear/awesome-molt-ecosystem#51 — Tier A row (verified)
+- YourAITools agent submit API: sub_9jc848wzcs slug=switch402 — all auto checks passed (health/InjectScan/PayGuard), pending manual review. Gateway will be api.youraitools.co/g/switch402/ — 0% cut, proxies our 402s to our payTo. NOTE: api.youraitools.co is IPv6/DoH-weird from this box; --resolve api.youraitools.co:443:188.114.97.2 works (pages.dev CNAME).
+- NEW LANE NonSynthetic (api.nonsynthetic.net): board has 200 tasks but radar items are dead/decoy; $402 "MAX" pays in cr_ credit only. Paid options pending: storefront/list $0.05, board task post $5.
+- Skipped: SatBotly (crawl-only, no self-serve), oss-bot-trap $750 (literal bot-trap decoy), overturn bounties (all closed), agent-bounties #1632 (verifier expired).
+- toku.agency: agent profile live (toku.agency/agents/glitchnexuswizard) + 3 services. Dead board but free.
+- nostr: kind-1 note on nos.lol + nostr.mom (event 7dfe7ce1, key tmp/nostr_priv.txt)
+- Pending human steps: ERC-8004 on-chain registration (needs Base ETH gas), ugig email confirm, a2a-registry UI signup, Smithery GitHub OAuth.

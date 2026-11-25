@@ -109,13 +109,14 @@ const TOOLS = [
   {
     name: 'act',
     description:
-      'Execute an atomic JSON capability on Switch402 (auto-routes to best P2P worker or House fallback and settles in nano-USD).',
+      'Execute an atomic JSON capability on Switch402 (includes 10 FREE starter calls across web.search, chain.token_report, market.quote, trade.signal, web.fetch_markdown, web.verify_url, and trade.notarize!).',
     inputSchema: {
       type: 'object',
       properties: {
         skill: {
           type: 'string',
-          description: 'Skill identifier without act: prefix (e.g. "web.search", "web.fetch_markdown", "chain.token_report", "web.verify_url", "util.sha256")',
+          description:
+            'Skill identifier without act: prefix (e.g. "web.search", "chain.token_report", "market.quote", "trade.signal", "web.fetch_markdown", "web.verify_url", "trade.notarize")',
         },
         input: {
           type: 'object',
@@ -130,9 +131,47 @@ const TOOLS = [
     },
   },
   {
+    name: 'trade_decide',
+    description:
+      'One-call sub-second market decision loop: chains market.quote + quantitative trade.signal (EMA-9/21, RSI-14, ATR%, Bollinger %B) + Ed25519-signed notarized receipt URL.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol: {
+          type: 'string',
+          description: 'Asset symbol or pair (e.g. "ETH-USD", "BTC", "SOL")',
+        },
+        interval: {
+          type: 'string',
+          description: 'Candle interval ("1m", "5m", "15m", "1h", "4h", "1d"; default "5m")',
+        },
+        candles: {
+          type: 'array',
+          description: 'Optional deterministic candle array for offline evaluation',
+        },
+      },
+      required: ['symbol'],
+    },
+  },
+  {
+    name: 'get_receipt',
+    description:
+      'Fetch and verify an Ed25519-signed Switch402 execution receipt (rcpt_...) for third-party proof.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        receiptId: {
+          type: 'string',
+          description: 'Receipt ID (rcpt_...)',
+        },
+      },
+      required: ['receiptId'],
+    },
+  },
+  {
     name: 'chat_inference',
     description:
-      'Run chat completion inference on any model on Switch402. Every registered agent gets 10 FREE sandbox calls on "switch402/instant-test"!',
+      'Run chat completion inference on any model on Switch402. Every registered agent gets 10 FREE starter calls!',
     inputSchema: {
       type: 'object',
       properties: {
@@ -173,15 +212,30 @@ const TOOLS = [
   {
     name: 'deposit_lightning',
     description:
-      'Generate a Bitcoin Lightning (bolt11) deposit invoice to top up your Switch402 agent balance.',
+      'Generate a Bitcoin Lightning (bolt11) deposit invoice ($0.005+ / ~5+ sats) to top up your Switch402 agent balance.',
     inputSchema: {
       type: 'object',
       properties: {
         amountUsd: {
           type: 'number',
-          description: 'Deposit amount in USD (between 0.01 and 10000, default 1.00)',
+          description: 'Deposit amount in USD (between 0.005 and 10000, default 0.10)',
         },
       },
+    },
+  },
+  {
+    name: 'verify_lightning_deposit',
+    description:
+      'Instantly check & credit a paid Lightning deposit invoice (lninv_...) without waiting for webhooks.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        invoiceId: {
+          type: 'string',
+          description: 'Lightning invoiceId returned by deposit_lightning',
+        },
+      },
+      required: ['invoiceId'],
     },
   },
 ]
@@ -260,10 +314,72 @@ async function executeTool(name, toolArgs = {}) {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${key}`,
       },
-      body: JSON.stringify({ amountUsd: toolArgs.amountUsd ?? 1.0 }),
+      body: JSON.stringify({ amountUsd: toolArgs.amountUsd ?? 0.1 }),
       signal: AbortSignal.timeout(12_000),
     })
     return await resp.json()
+  }
+
+  if (name === 'verify_lightning_deposit') {
+    const key = await ensureApiKey()
+    const resp = await fetch(`${SERVER_URL}/v1/wallet/deposit/lightning/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({ invoiceId: toolArgs.invoiceId }),
+      signal: AbortSignal.timeout(12_000),
+    })
+    return await resp.json()
+  }
+
+  if (name === 'get_receipt') {
+    const receiptId = String(toolArgs.receiptId || '').trim()
+    const resp = await fetch(`${SERVER_URL}/v1/receipts/${encodeURIComponent(receiptId)}`, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(10_000),
+    })
+    return await resp.json()
+  }
+
+  if (name === 'trade_decide') {
+    const symbol = String(toolArgs.symbol || 'ETH-USD')
+    const interval = String(toolArgs.interval || '5m')
+    const hasCandles = Array.isArray(toolArgs.candles)
+    const quoteRes = hasCandles ? null : await executeTool('act', { skill: 'market.quote', input: { symbol } })
+    if (quoteRes && quoteRes.status === 402) return quoteRes
+
+    const sigRes = await executeTool('act', {
+      skill: 'trade.signal',
+      input: { symbol, interval, ...(hasCandles ? { candles: toolArgs.candles } : {}) },
+    })
+    if (sigRes.status === 402 || !sigRes.ok) return sigRes
+
+    const notaryRes = await executeTool('act', {
+      skill: 'trade.notarize',
+      input: {
+        payload: {
+          symbol: sigRes.output?.symbol || symbol,
+          interval,
+          quoteMidUsd: quoteRes?.output?.midUsd ?? sigRes.output?.indicators?.price ?? null,
+          action: sigRes.output?.action,
+          regime: sigRes.output?.regime,
+          confidence: sigRes.output?.confidence,
+          indicators: sigRes.output?.indicators,
+        },
+        note: 'mcp:trade_decide',
+      },
+    })
+    return {
+      ok: true,
+      symbol: sigRes.output?.symbol || symbol,
+      quote: quoteRes?.output || null,
+      signal: sigRes.output,
+      notarization: notaryRes.ok ? notaryRes.output : null,
+      proofReceiptId: notaryRes.ok ? notaryRes.receiptId : sigRes.receiptId,
+      proofReceiptUrl: notaryRes.ok ? notaryRes.receiptUrl : sigRes.receiptUrl,
+    }
   }
 
   if (name === 'act') {
@@ -288,8 +404,8 @@ async function executeTool(name, toolArgs = {}) {
         status: 402,
         ...body,
         nextSteps: {
-          tryFreeSandbox: 'Call chat_inference with model="switch402/instant-test" (10 free sandbox calls included!)',
-          topupLightning: 'Call deposit_lightning(amountUsd=1.0) to get a bolt11 invoice',
+          topupLightningInstant:
+            'Call deposit_lightning(amountUsd=0.10) then verify_lightning_deposit(invoiceId) (~100 sats)',
           topupBaseUsdc: `POST ${SERVER_URL}/v1/wallet/topup/x402?amountUsd=1.00`,
           earnCreditsFree: `npx switch402 serve --auto-ollama --server ${SERVER_URL}`,
         },

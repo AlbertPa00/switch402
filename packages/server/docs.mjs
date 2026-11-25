@@ -180,6 +180,14 @@ export function buildOpenApiSpec(origin, marketSnapshot) {
         responses: { 200: { description: 'x402 discovery JSON' } },
       },
     },
+    '/.well-known/api-catalog': {
+      get: {
+        operationId: 'apiCatalog',
+        security: [],
+        summary: 'RFC 9727 API catalog linkset: OpenAPI, llms.txt, skill.md, x402, health (free)',
+        responses: { 200: { description: 'Linkset JSON' } },
+      },
+    },
     '/.well-known/agent.json': {
       get: {
         operationId: 'agentManifest',

@@ -4,11 +4,15 @@ import { randomBytes } from 'node:crypto'
 import {
   computeHouseSplit,
   computeP2PSplit,
+  generateAgentIdentity,
   generateApiKey,
   hashApiKey,
   jwkThumbprint,
   nanoToUsd,
+  sha256Hex,
+  signEd25519,
   usdToNano,
+  verifyEd25519,
 } from '../protocol/index.mjs'
 
 /**
@@ -60,8 +64,12 @@ export class NanoLedger {
 
     /** @type {Array<any>} recent receipts ring buffer (last 200 in RAM) */
     this.recentReceipts = []
+    /** @type {Map<string, any>} receiptId -> full verifiable receipt (capped at 5000 in RAM) */
+    this.receiptById = new Map()
     /** @type {Map<string, Array<{ ts: number, amountNano: bigint }>>} agentId -> withdrawals */
     this.withdrawHistory = new Map()
+
+    this.receiptSigner = this._initReceiptSigner()
 
     this._walFd = null
     if (this.dataDir) {
@@ -879,10 +887,76 @@ export class NanoLedger {
     }
   }
 
+  _initReceiptSigner() {
+    if (this.dataDir) {
+      fs.mkdirSync(this.dataDir, { recursive: true })
+      const keyPath = path.join(this.dataDir, 'receipt-signer.jwk.json')
+      if (fs.existsSync(keyPath)) {
+        try {
+          return JSON.parse(fs.readFileSync(keyPath, 'utf8'))
+        } catch {
+          // regenerate if corrupted
+        }
+      }
+      const ident = generateAgentIdentity()
+      fs.writeFileSync(keyPath, JSON.stringify(ident, null, 2), { mode: 0o600 })
+      return ident
+    }
+    return generateAgentIdentity()
+  }
+
+  /**
+   * Attach deterministic input/output SHA-256 digests and optional public attestation fields to a receipt.
+   */
+  attachReceiptProof(receiptId, { input, output, publicSummary = null } = {}) {
+    const rec = this.receiptById.get(receiptId)
+    if (!rec) return null
+    if (input !== undefined) {
+      rec.inputSha256 = sha256Hex(typeof input === 'string' ? input : JSON.stringify(input ?? null))
+    }
+    if (output !== undefined) {
+      rec.outputSha256 = sha256Hex(typeof output === 'string' ? output : JSON.stringify(output ?? null))
+    }
+    if (publicSummary && typeof publicSummary === 'object') {
+      rec.attestation = publicSummary
+    }
+    return rec
+  }
+
+  /**
+   * Build and sign a verifiable Ed25519 receipt document for public audit (`GET /v1/receipts/:id`).
+   */
+  getSignedReceipt(receiptId) {
+    const rec = this.receiptById.get(receiptId)
+    if (!rec) return null
+    const canonical = [
+      'switch402-receipt-v1',
+      rec.receiptId,
+      String(rec.ts),
+      rec.capability,
+      rec.mode,
+      rec.grossUsd,
+      String(rec.latencyMs ?? 0),
+      rec.inputSha256 || '',
+      rec.outputSha256 || '',
+    ].join('\n')
+    const signature = signEd25519(this.receiptSigner.privateJwk, canonical)
+    return {
+      schema: 'switch402-receipt-v1',
+      ...rec,
+      canonicalMessage: canonical,
+      signature,
+      signerKeyId: this.receiptSigner.keyId,
+      signerPublicJwk: this.receiptSigner.publicJwk,
+      verified: verifyEd25519(this.receiptSigner.publicJwk, canonical, signature),
+    }
+  }
+
   _pushReceipt(ev) {
-    this.recentReceipts.push({
+    const entry = {
       receiptId: ev.receiptId,
       ts: ev.ts,
+      utc: new Date(ev.ts).toISOString(),
       mode:
         ev.type === 'SETTLE_P2P'
           ? 'p2p'
@@ -893,10 +967,16 @@ export class NanoLedger {
       buyerId: ev.buyerId,
       sellerId: ev.sellerId || 'house_upstream',
       grossUsd: nanoToUsd(ev.grossNano || ev.buyerTotalNano || '0', 6),
-      latencyMs: ev.latencyMs,
-    })
+      latencyMs: ev.latencyMs ?? 0,
+    }
+    this.recentReceipts.push(entry)
     if (this.recentReceipts.length > 200) {
       this.recentReceipts.shift()
+    }
+    this.receiptById.set(entry.receiptId, entry)
+    if (this.receiptById.size > 5000) {
+      const oldestKey = this.receiptById.keys().next().value
+      if (oldestKey) this.receiptById.delete(oldestKey)
     }
   }
 

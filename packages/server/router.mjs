@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto'
-import { nanoToUsd, usdToNano } from '../protocol/index.mjs'
+import { nanoToUsd, sha256Hex, usdToNano } from '../protocol/index.mjs'
+import { canonicalJsonString, computeTradeSignalFromCandles } from './upstream.mjs'
 
 /**
  * Hardened Live WebSocket Seller Registry, Score-Based Router, TTFT Auto-Failover & 1% Canary Slashing Engine.
@@ -30,9 +31,41 @@ export class SellerRouter {
     this.sessions = new Map()
     /** @type {Map<string, Set<string>>} capability -> Set<sessionId> */
     this.capIndex = new Map()
+    /** @type {Map<string, { calls: number, samples: number[] }>} capability -> rolling latency window */
+    this.latencySamples = new Map()
 
     this._pingTimer = setInterval(() => this._heartbeat(), 20_000)
     this._pingTimer.unref()
+  }
+
+  recordLatency(capability, latencyMs) {
+    const ms = Math.max(0, Math.round(Number(latencyMs || 0)))
+    let entry = this.latencySamples.get(capability)
+    if (!entry) {
+      entry = { calls: 0, samples: [] }
+      this.latencySamples.set(capability, entry)
+    }
+    entry.calls += 1
+    entry.samples.push(ms)
+    if (entry.samples.length > 128) entry.samples.shift()
+  }
+
+  getLatencyStats(capability) {
+    const entry = this.latencySamples.get(capability)
+    if (!entry || entry.samples.length === 0) return null
+    const sorted = [...entry.samples].sort((a, b) => a - b)
+    const p50Idx = Math.floor((sorted.length - 1) * 0.5)
+    const p95Idx = Math.floor((sorted.length - 1) * 0.95)
+    return {
+      calls: entry.calls,
+      p50Ms: sorted[p50Idx],
+      p95Ms: sorted[p95Idx],
+    }
+  }
+
+  canFulfill(capability, maxPriceUsd = Infinity) {
+    if (this.house.canFulfill(capability)) return true
+    return this.rankCandidates(capability, { maxPriceUsd }).length > 0
   }
 
   close() {
@@ -251,11 +284,13 @@ export class SellerRouter {
       const est = this._estimateSellerChargeNano(item.cap, body)
       if (est > maxP2pNano) maxP2pNano = est
     }
-    const houseNano = this.house.canFulfill(capability)
+    const houseCan = this.house.canFulfill(capability)
+    const houseNano = houseCan
       ? (this.house.estimateMaxWholesaleNano(capability, body) * 11500n) / 10000n
       : 0n
     const maxNano = maxP2pNano > houseNano ? maxP2pNano : houseNano
-    return maxNano > 0n ? maxNano : usdToNano('0.002')
+    if (houseCan || ranked.length > 0) return maxNano
+    return usdToNano('0.002')
   }
 
   _estimateSellerChargeNano(cap, body = {}) {
@@ -346,6 +381,8 @@ export class SellerRouter {
           units: verifiedTokens,
           latencyMs,
         })
+        this.recordLatency(capability, latencyMs)
+        this.ledger.attachReceiptProof(settlement.receiptId, { input: body, output: res.result })
 
         return {
           provider: session.agentId,
@@ -379,6 +416,8 @@ export class SellerRouter {
         units: houseRes.totalTokens,
         latencyMs,
       })
+      this.recordLatency(capability, latencyMs)
+      this.ledger.attachReceiptProof(settlement.receiptId, { input: body, output: houseRes.responseObj })
       return {
         provider: 'house_upstream',
         mode: 'house_fallback',
@@ -429,6 +468,12 @@ export class SellerRouter {
           units: 1,
           latencyMs,
         })
+        this.recordLatency(capability, latencyMs)
+        this.ledger.attachReceiptProof(settlement.receiptId, {
+          input,
+          output: res.result,
+          publicSummary: buildPublicAttestationSummary(skill, res.result),
+        })
 
         return {
           provider: session.agentId,
@@ -461,6 +506,12 @@ export class SellerRouter {
         wholesaleNano: houseRes.wholesaleNano,
         units: 1,
         latencyMs,
+      })
+      this.recordLatency(capability, latencyMs)
+      this.ledger.attachReceiptProof(settlement.receiptId, {
+        input,
+        output: houseRes.output,
+        publicSummary: buildPublicAttestationSummary(skill, houseRes.output),
       })
       return {
         provider: 'house_upstream',
@@ -521,13 +572,47 @@ export class SellerRouter {
     }
 
     if (capability === 'act:util.sha256') {
-      const probe = 'switch402-canary-probe'
-      const expectedSha = 'b18a72b285a080f12412c0932eb5f9e0a6ebfb8c1258e5e6fd0508ab79eb2440'
+      const probe = `switch402-canary-${randomBytes(4).toString('hex')}`
+      const expectedSha = sha256Hex(probe)
       const res = await this._dispatchWorkerJob(session, cap, { text: probe }, { stream: false })
       if (res.result?.sha256 !== expectedSha) {
         return this._slashAndBan(
           session,
           `Canary sha256 mismatch on ${capability}: got ${res.result?.sha256}`
+        )
+      }
+      return { passed: true, capability }
+    }
+
+    if (capability === 'act:trade.signal') {
+      const base = 100 + (randomBytes(1)[0] % 50)
+      const dir = randomBytes(1)[0] % 2 === 0 ? 1 : -1
+      const candles = Array.from({ length: 28 }, (_, idx) => Number((base + dir * idx * 1.5).toFixed(2)))
+      const expected = computeTradeSignalFromCandles(candles, { symbol: 'CANARY', interval: '5m' })
+      const res = await this._dispatchWorkerJob(
+        session,
+        cap,
+        { symbol: 'CANARY', interval: '5m', candles },
+        { stream: false }
+      )
+      if (res.result?.action !== expected.action) {
+        return this._slashAndBan(
+          session,
+          `Canary trade.signal mismatch on ${capability}: expected action "${expected.action}", got "${res.result?.action}"`
+        )
+      }
+      return { passed: true, capability }
+    }
+
+    if (capability === 'act:trade.notarize') {
+      const nonce = randomBytes(4).toString('hex')
+      const payload = { b: 2, a: nonce }
+      const expectedSha = sha256Hex(canonicalJsonString(payload))
+      const res = await this._dispatchWorkerJob(session, cap, { payload }, { stream: false })
+      if (res.result?.sha256 !== expectedSha) {
+        return this._slashAndBan(
+          session,
+          `Canary trade.notarize mismatch on ${capability}: got ${res.result?.sha256}`
         )
       }
       return { passed: true, capability }
@@ -727,6 +812,7 @@ export class SellerRouter {
       }
 
       if (sellersOnline > 0) {
+        const lat = this.getLatencyStats(capName)
         p2pMap.set(capName, {
           capability: capName,
           kind,
@@ -734,13 +820,24 @@ export class SellerRouter {
           floorPriceUsd: minPrice,
           priceUnit: kind === 'chat' ? 'per_1m_tokens' : 'per_call',
           bestEmaLatencyMs: bestLatency,
+          ...(lat ? { p50LatencyMs: lat.p50Ms, p95LatencyMs: lat.p95Ms, settledCalls: lat.calls } : {}),
           description,
           source: 'p2p_live',
         })
       }
     }
 
-    const houseList = this.house.listAvailableCapabilities()
+    const houseList = this.house.listAvailableCapabilities().map((item) => {
+      const lat = this.getLatencyStats(item.capability)
+      return lat
+        ? { ...item, p50LatencyMs: lat.p50Ms, p95LatencyMs: lat.p95Ms, settledCalls: lat.calls }
+        : item
+    })
+    const latencyByCapability = {}
+    for (const capName of this.latencySamples.keys()) {
+      const stats = this.getLatencyStats(capName)
+      if (stats) latencyByCapability[capName] = stats
+    }
     const unmetDemand = []
     for (const [capName, stats] of this.house.unmetDemandTracker.entries()) {
       if (!p2pMap.has(capName)) {
@@ -764,6 +861,57 @@ export class SellerRouter {
       p2pBook: Array.from(p2pMap.values()),
       houseFallbackBook: houseList,
       unmetDemandFeed: unmetDemand,
+      latencyByCapability,
     }
   }
+}
+
+export function buildPublicAttestationSummary(skill, out) {
+  if (!out || typeof out !== 'object') return null
+  if (skill === 'web.verify_url') {
+    return {
+      url: out.url,
+      status: out.status,
+      bytes: out.bytes,
+      sha256: out.sha256,
+      fetchedUtc: out.fetchedUtc,
+    }
+  }
+  if (skill === 'trade.notarize') {
+    return {
+      sha256: out.sha256,
+      bytes: out.bytes,
+      note: out.note || null,
+      notarizedUtc: out.notarizedUtc,
+    }
+  }
+  if (skill === 'chain.token_report') {
+    return {
+      chain: out.chain,
+      address: out.address,
+      symbol: out.token?.symbol || null,
+      riskScore: out.riskScore,
+      riskLevel: out.riskLevel,
+      fetchedUtc: out.fetchedUtc,
+    }
+  }
+  if (skill === 'trade.signal') {
+    return {
+      symbol: out.symbol,
+      interval: out.interval,
+      action: out.action,
+      regime: out.regime,
+      confidence: out.confidence,
+    }
+  }
+  if (skill === 'market.quote') {
+    return {
+      symbol: out.symbol,
+      midUsd: out.midUsd,
+      spreadBps: out.spreadBps,
+      venueCount: out.venueCount,
+      fetchedUtc: out.fetchedUtc,
+    }
+  }
+  return null
 }

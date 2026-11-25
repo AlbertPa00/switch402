@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { acceptWebSocketUpgrade, nanoToUsd, usdToNano } from '../protocol/index.mjs'
 import { NanoLedger } from './ledger.mjs'
 import { HouseUpstream } from './upstream.mjs'
-import { SellerRouter } from './router.mjs'
+import { SellerRouter, buildPublicAttestationSummary } from './router.mjs'
 import { PaymentEngine } from './payments.mjs'
 import { HeartbeatBuyer } from './heartbeat.mjs'
 import {
@@ -11,6 +11,7 @@ import {
   buildLlmsTxt,
   buildOpenApiSpec,
   renderDashboardHtml,
+  renderReceiptHtml,
 } from './docs.mjs'
 
 /**
@@ -203,13 +204,61 @@ async function handleHttpRequest(req, res, ctx) {
     return
   }
 
+  if (method === 'GET' && pathname === '/.well-known/api-catalog') {
+    res.writeHead(200, { 'Content-Type': 'application/linkset+json' })
+    res.end(JSON.stringify({
+      linkset: [
+        {
+          anchor: origin,
+          'service-desc': [
+            { href: `${origin}/openapi.json`, type: 'application/vnd.oai.openapi+json' },
+            { href: `${origin}/.well-known/x402`, type: 'application/json' },
+          ],
+          'service-doc': [
+            { href: `${origin}/llms.txt`, type: 'text/plain' },
+            { href: `${origin}/skill.md`, type: 'text/markdown' },
+          ],
+          status: [{ href: `${origin}/health` }],
+        },
+      ],
+    }))
+    return
+  }
+
   if (method === 'GET' && pathname === '/v1/leaderboard') {
     sendJson(res, 200, heartbeat.getSnapshot())
     return
   }
 
+  if (method === 'GET' && pathname.startsWith('/v1/receipts/')) {
+    const receiptId = decodeURIComponent(pathname.slice('/v1/receipts/'.length)).trim()
+    const signed = ledger.getSignedReceipt(receiptId)
+    if (!signed) {
+      sendJson(res, 404, { error: `Unknown receiptId: ${receiptId}` })
+      return
+    }
+    const accept = String(req.headers.accept || '')
+    if (accept.includes('text/html')) {
+      const html = renderReceiptHtml(origin, signed)
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(html)
+      return
+    }
+    sendJson(res, 200, signed)
+    return
+  }
+
   if (method === 'POST' && pathname === '/mcp') {
-    await handleRemoteMcp(req, res, { ledger, house, router, payments, heartbeat, origin })
+    await handleRemoteMcp(req, res, {
+      ledger,
+      house,
+      router,
+      payments,
+      heartbeat,
+      origin,
+      regRateLimits,
+      maxRegistrationsPerIpPerHour,
+    })
     return
   }
 
@@ -398,6 +447,21 @@ async function handleHttpRequest(req, res, ctx) {
     return
   }
 
+  if (method === 'POST' && pathname === '/v1/wallet/deposit/lightning/verify') {
+    const agent = authenticateBearer(req, ledger)
+    const body = await readJsonBody(req)
+    try {
+      const verified = await payments.verifyLightningDeposit({
+        invoiceId: body.invoiceId,
+        agentId: agent ? agent.id : null,
+      })
+      sendJson(res, 200, verified)
+    } catch (err) {
+      sendJson(res, err.statusCode || 400, { error: err.message })
+    }
+    return
+  }
+
   if (method === 'POST' && pathname === '/v1/webhooks/lightning') {
     const rawBuf = await readRawBody(req)
     let payload
@@ -407,10 +471,20 @@ async function handleHttpRequest(req, res, ctx) {
       sendJson(res, 400, { error: 'Invalid JSON body' })
       return
     }
+    const sigHdr = String(req.headers['x-webhook-signature'] || '')
+    if (!sigHdr && payments.coinosApiToken && !payments.webhookSecret) {
+      try {
+        const pulled = await payments.handleCoinosNotification(payload)
+        sendJson(res, 200, pulled || { ok: true, ignored: true })
+      } catch (err) {
+        sendJson(res, err.statusCode || 502, { error: err.message })
+      }
+      return
+    }
     try {
       const result = payments.handleLightningWebhook({
         rawBody: rawBuf,
-        signatureHeader: req.headers['x-webhook-signature'] || '',
+        signatureHeader: sigHdr,
         payload,
       })
       sendJson(res, 200, result)
@@ -518,6 +592,16 @@ async function handleHttpRequest(req, res, ctx) {
       return
     }
 
+    if (hasPaymentSig && !router.canFulfill(capability)) {
+      sendJson(res, 503, {
+        error: {
+          message: `No online P2P seller or House upstream currently available for ${capability} — your x402 payment was NOT settled.`,
+          type: 'capability_unavailable',
+        },
+      })
+      return
+    }
+
     const reserveNano = router.estimateBuyerReserveNano(capability, body)
 
     const authResult = await resolveBuyerAndReserve({
@@ -616,7 +700,72 @@ async function handleHttpRequest(req, res, ctx) {
       : Infinity
 
     const capability = `act:${skill}`
+    const hasPaymentSig = Boolean(req.headers['payment-signature'] || req.headers['x-payment'])
+    if (hasPaymentSig && !router.canFulfill(capability, maxPriceUsd)) {
+      sendJson(res, 503, {
+        error: `No online P2P seller or House upstream available for ${capability} — your x402 payment was NOT settled.`,
+      })
+      return
+    }
+
     const reserveNano = router.estimateBuyerReserveNano(capability, input, maxPriceUsd)
+
+    // Zero-friction habit funnel: allow registered agents with $0 balance to spend their 10 free
+    // starter calls across ANY zero-marginal-cost House `act:*` skill when no P2P seller is matched.
+    const bearerAgent = authenticateBearer(req, ledger)
+    if (
+      bearerAgent &&
+      !bearerAgent.banned &&
+      !hasPaymentSig &&
+      bearerAgent.spendableNano < reserveNano &&
+      (bearerAgent.sandboxCallsRemaining || 0) > 0 &&
+      house.isSandboxEligible(capability) &&
+      router.rankCandidates(capability, { excludeAgents: new Set([bearerAgent.id]), maxPriceUsd }).length === 0
+    ) {
+      const startedAt = Date.now()
+      try {
+        const houseRes = await house.executeSkill(skill, input)
+        const latencyMs = Date.now() - startedAt
+        const sbx = ledger.consumeSandboxCall(bearerAgent.id, capability, latencyMs)
+        router.recordLatency(capability, latencyMs)
+        if (sbx?.receiptId) {
+          ledger.attachReceiptProof(sbx.receiptId, {
+            input,
+            output: houseRes.output,
+            publicSummary: buildPublicAttestationSummary(skill, houseRes.output),
+          })
+        }
+        const receiptId = sbx?.receiptId || 'sbx'
+        const receiptUrl = `${origin}/v1/receipts/${receiptId}`
+        sendJson(
+          res,
+          200,
+          {
+            ok: true,
+            capability,
+            mode: 'sandbox_free',
+            provider: 'switch402_sandbox',
+            receiptId,
+            receiptUrl,
+            costUsd: '0.000000',
+            sandboxCallsRemaining: sbx?.remainingSandboxCalls ?? 0,
+            latencyMs,
+            output: houseRes.output,
+          },
+          {
+            'X-Switch402-Receipt': receiptId,
+            'X-Switch402-Receipt-Url': receiptUrl,
+            'X-Switch402-Mode': 'sandbox_free',
+            'X-Switch402-Provider': 'switch402_sandbox',
+            'X-Switch402-Cost-Usd': '0.000000',
+            'X-Switch402-Sandbox-Remaining': String(sbx?.remainingSandboxCalls ?? 0),
+          }
+        )
+      } catch (err) {
+        sendJson(res, 502, { error: err.message })
+      }
+      return
+    }
 
     const authResult = await resolveBuyerAndReserve({
       req,
@@ -642,6 +791,7 @@ async function handleHttpRequest(req, res, ctx) {
         maxPriceUsd,
         signal: abortCtrl.signal,
       })
+      const receiptUrl = `${origin}/v1/receipts/${out.settlement.receiptId}`
       sendJson(
         res,
         200,
@@ -651,12 +801,14 @@ async function handleHttpRequest(req, res, ctx) {
           mode: out.mode,
           provider: out.provider,
           receiptId: out.settlement.receiptId,
+          receiptUrl,
           costUsd: nanoToUsd(out.settlement.grossNano, 6),
           latencyMs: out.latencyMs,
           output: out.output,
         },
         {
           'X-Switch402-Receipt': out.settlement.receiptId,
+          'X-Switch402-Receipt-Url': receiptUrl,
           'X-Switch402-Mode': out.mode,
           'X-Switch402-Provider': out.provider,
           'X-Switch402-Cost-Usd': nanoToUsd(out.settlement.grossNano, 6),
@@ -818,7 +970,11 @@ function sendJson(res, status, obj, extraHeaders = {}) {
  * Stateless Remote Streamable HTTP MCP Endpoint (`POST /mcp`).
  * Allows web/remote MCP clients to discover and call Switch402 tools without running `npx`.
  */
-async function handleRemoteMcp(req, res, { ledger, house, router, payments, heartbeat, origin }) {
+async function handleRemoteMcp(
+  req,
+  res,
+  { ledger, house, router, payments, heartbeat, origin, regRateLimits, maxRegistrationsPerIpPerHour }
+) {
   let msg
   try {
     msg = await readJsonBody(req)
@@ -836,13 +992,25 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
 
   const tools = [
     {
-      name: 'find_capability',
+      name: 'register_agent',
       description:
-        'Discover live P2P & House LLM models and atomic JSON capabilities on Switch402 with floor prices and latency.',
+        'Register a new Switch402 agent key instantly (0 KYC, includes 10 FREE starter calls across web.search, chain.token_report, market.quote, trade.signal, and all House skills).',
       inputSchema: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Optional keyword filter (e.g. "fetch_markdown", "qwen", "verify")' },
+          name: { type: 'string', description: 'Optional agent handle' },
+          referredBy: { type: 'string', description: 'Optional referrer agentId (ag_...)' },
+        },
+      },
+    },
+    {
+      name: 'find_capability',
+      description:
+        'Discover live P2P & House LLM models and atomic JSON capabilities on Switch402 with floor prices and p50/p95 latency.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Optional keyword filter (e.g. "search", "token", "signal", "quote")' },
         },
       },
     },
@@ -851,8 +1019,96 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
       description: 'Get exact inputSchema, example payload, and live pricing for a specific Switch402 capability.',
       inputSchema: {
         type: 'object',
-        properties: { capability: { type: 'string', description: 'Skill or model name (e.g. "web.fetch_markdown")' } },
+        properties: { capability: { type: 'string', description: 'Skill or model name (e.g. "web.search", "trade.signal")' } },
         required: ['capability'],
+      },
+    },
+    {
+      name: 'act',
+      description:
+        'Execute an atomic JSON capability (e.g. "web.search", "chain.token_report", "market.quote", "trade.signal", "web.fetch_markdown", "web.verify_url", "trade.notarize").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          skill: { type: 'string', description: 'Skill name without act: prefix' },
+          input: { type: 'object', description: 'JSON input payload' },
+          apiKey: { type: 'string', description: 'Optional ag_live_... key (if not passed in Authorization header)' },
+        },
+        required: ['skill'],
+      },
+    },
+    {
+      name: 'trade_decide',
+      description:
+        'One-call sub-second market decision loop: fetches multi-venue quote + quantitative regime/signal (EMA-9/21, RSI-14, ATR%, Bollinger %B) + Ed25519-signed receipt URL.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          symbol: { type: 'string', description: 'Asset symbol or pair (e.g. "ETH-USD", "BTC", "SOL")' },
+          interval: { type: 'string', description: 'Candle interval ("1m", "5m", "15m", "1h", "4h", "1d"; default "5m")' },
+          candles: { type: 'array', description: 'Optional deterministic candle closes/objects for offline evaluation' },
+          apiKey: { type: 'string', description: 'Optional ag_live_... key (if not passed in Authorization header)' },
+        },
+        required: ['symbol'],
+      },
+    },
+    {
+      name: 'get_receipt',
+      description: 'Fetch and cryptographically verify an Ed25519-signed Switch402 execution receipt (rcpt_...).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          receiptId: { type: 'string', description: 'Receipt ID (rcpt_...)' },
+        },
+        required: ['receiptId'],
+      },
+    },
+    {
+      name: 'chat_inference',
+      description:
+        'Run chat completion on Switch402 (every registered agent gets 10 free starter calls).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          model: { type: 'string', description: 'Model ID (e.g. "switch402/instant-test", "qwen/qwen3-32b")' },
+          prompt: { type: 'string', description: 'User prompt' },
+          system: { type: 'string', description: 'Optional system instruction' },
+          apiKey: { type: 'string', description: 'Optional ag_live_... key (if not passed in Authorization header)' },
+        },
+        required: ['model', 'prompt'],
+      },
+    },
+    {
+      name: 'wallet_status',
+      description: 'View your Switch402 balance, free sandbox calls remaining, $2.00 Quality Bond, and referral earnings.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          apiKey: { type: 'string', description: 'Optional ag_live_... key (if not passed in Authorization header)' },
+        },
+      },
+    },
+    {
+      name: 'deposit_lightning',
+      description: 'Create a Bitcoin Lightning (bolt11) invoice ($0.005+ / ~5+ sats) to top up your Switch402 agent balance.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          amountUsd: { type: 'number', description: 'Deposit amount in USD (min 0.005, default 0.10)' },
+          apiKey: { type: 'string', description: 'Optional ag_live_... key (if not passed in Authorization header)' },
+        },
+      },
+    },
+    {
+      name: 'verify_lightning_deposit',
+      description: 'Instantly check & credit a paid Lightning deposit invoice (lninv_...).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          invoiceId: { type: 'string', description: 'Lightning invoiceId returned by deposit_lightning' },
+          apiKey: { type: 'string', description: 'Optional ag_live_... key' },
+        },
+        required: ['invoiceId'],
       },
     },
     {
@@ -864,37 +1120,6 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
       name: 'leaderboard',
       description: 'View live P2P seller speed leaderboard and Heartbeat Benchmark status.',
       inputSchema: { type: 'object', properties: {} },
-    },
-    {
-      name: 'wallet_status',
-      description: 'View your Switch402 balance, free sandbox calls remaining, $2.00 Quality Bond, and referral earnings.',
-      inputSchema: { type: 'object', properties: {} },
-    },
-    {
-      name: 'chat_inference',
-      description:
-        'Run chat completion on Switch402 (every registered agent gets 10 free sandbox calls on "switch402/instant-test").',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          model: { type: 'string', description: 'Model ID (e.g. "switch402/instant-test", "qwen/qwen3-32b")' },
-          prompt: { type: 'string', description: 'User prompt' },
-          system: { type: 'string', description: 'Optional system instruction' },
-        },
-        required: ['model', 'prompt'],
-      },
-    },
-    {
-      name: 'act',
-      description: 'Execute an atomic JSON capability (e.g. "web.search", "web.fetch_markdown", "chain.token_report", "web.verify_url", "util.sha256").',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          skill: { type: 'string', description: 'Skill name without act: prefix' },
-          input: { type: 'object', description: 'JSON input payload' },
-        },
-        required: ['skill'],
-      },
     },
   ]
 
@@ -974,7 +1199,9 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
     const toolName = msg.params?.name
     const toolArgs = msg.params?.arguments || {}
     const snap = router.getMarketSnapshot()
-    const agent = authenticateBearer(req, ledger)
+    const agent =
+      authenticateBearer(req, ledger) ||
+      (toolArgs.apiKey ? ledger.getAgentByApiKey(String(toolArgs.apiKey).trim()) : null)
 
     const okResult = (obj) =>
       sendJson(res, 200, {
@@ -983,7 +1210,99 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
         result: { content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] },
       })
 
+    const runActForMcpAgent = async (targetAgent, skill, input) => {
+      const capability = `act:${skill}`
+      const reserveNano = router.estimateBuyerReserveNano(capability, input)
+      if (
+        !targetAgent.banned &&
+        targetAgent.spendableNano < reserveNano &&
+        (targetAgent.sandboxCallsRemaining || 0) > 0 &&
+        house.isSandboxEligible(capability) &&
+        router.rankCandidates(capability, { excludeAgents: new Set([targetAgent.id]) }).length === 0
+      ) {
+        const startedAt = Date.now()
+        const houseRes = await house.executeSkill(skill, input)
+        const latencyMs = Date.now() - startedAt
+        const sbx = ledger.consumeSandboxCall(targetAgent.id, capability, latencyMs)
+        router.recordLatency(capability, latencyMs)
+        if (sbx?.receiptId) {
+          ledger.attachReceiptProof(sbx.receiptId, {
+            input,
+            output: houseRes.output,
+            publicSummary: buildPublicAttestationSummary(skill, houseRes.output),
+          })
+        }
+        return {
+          ok: true,
+          mode: 'sandbox_free',
+          receiptId: sbx?.receiptId,
+          receiptUrl: `${origin}/v1/receipts/${sbx?.receiptId}`,
+          costUsd: '0.000000',
+          sandboxCallsRemaining: sbx?.remainingSandboxCalls ?? 0,
+          latencyMs,
+          output: houseRes.output,
+        }
+      }
+
+      const reservationId = ledger.reserve(targetAgent.id, reserveNano, 'call')
+      if (!reservationId) {
+        return {
+          ok: false,
+          status: 402,
+          error: 'Payment required (insufficient balance and 0 free sandbox calls remaining)',
+          spendableUsd: nanoToUsd(targetAgent.spendableNano),
+          requiredReserveUsd: nanoToUsd(reserveNano),
+          topupOptions: {
+            lightningInstant: 'Call deposit_lightning(amountUsd=0.10) then verify_lightning_deposit(invoiceId)',
+            x402BaseUsdc: `POST ${origin}/v1/wallet/topup/x402?amountUsd=1.00`,
+            earnFree: `npx switch402 serve --server ${origin} --auto-ollama`,
+          },
+        }
+      }
+      const out = await router.routeAct({ buyerId: targetAgent.id, reservationId, skill, input })
+      return {
+        ok: true,
+        mode: out.mode,
+        receiptId: out.settlement.receiptId,
+        receiptUrl: `${origin}/v1/receipts/${out.settlement.receiptId}`,
+        costUsd: nanoToUsd(out.settlement.grossNano, 6),
+        latencyMs: out.latencyMs,
+        output: out.output,
+      }
+    }
+
     try {
+      if (toolName === 'register_agent') {
+        const clientIp = String(
+          req.headers['fly-client-ip'] || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown'
+        )
+          .split(',')[0]
+          .trim()
+        if (regRateLimits) {
+          const now = Date.now()
+          const recent = (regRateLimits.get(clientIp) || []).filter((ts) => now - ts < 3_600_000)
+          if (recent.length >= (maxRegistrationsPerIpPerHour || 100)) {
+            return okResult({ error: 'Registration rate limit exceeded for this IP (try again later)' })
+          }
+          recent.push(now)
+          regRateLimits.set(clientIp, recent)
+        }
+        const reg = ledger.registerAgent({
+          name: toolArgs.name || 'remote-mcp-agent',
+          referredBy: toolArgs.referredBy || null,
+        })
+        return okResult({
+          ...reg,
+          usageHint:
+            'Pass this apiKey in the "apiKey" argument of act, trade_decide, chat_inference, wallet_status, or deposit_lightning!',
+        })
+      }
+
+      if (toolName === 'get_receipt') {
+        const signed = ledger.getSignedReceipt(String(toolArgs.receiptId || '').trim())
+        return okResult(signed || { error: `Unknown receiptId: ${toolArgs.receiptId}` })
+      }
+
       if (toolName === 'find_capability') {
         const q = String(toolArgs.query || '').toLowerCase().trim()
         const match = (item) =>
@@ -1026,17 +1345,39 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
         if (!agent) {
           return okResult({
             authenticated: false,
-            hint: `Pass Authorization: Bearer <ag_live_key> or register free (includes 10 free sandbox calls) via POST ${origin}/v1/agents/register`,
+            hint: 'Call the "register_agent" MCP tool first (0 KYC, includes 10 free starter calls) and pass the returned apiKey!',
           })
         }
         return okResult(ledger.serializeAccount(agent.id))
+      }
+
+      if (toolName === 'deposit_lightning') {
+        if (!agent) {
+          return okResult({
+            error: 'Authentication required',
+            hint: 'Call register_agent first and pass apiKey.',
+          })
+        }
+        const inv = await payments.createLightningDeposit({
+          agentId: agent.id,
+          amountUsd: toolArgs.amountUsd ?? 0.1,
+        })
+        return okResult(inv)
+      }
+
+      if (toolName === 'verify_lightning_deposit') {
+        const verified = await payments.verifyLightningDeposit({
+          invoiceId: toolArgs.invoiceId,
+          agentId: agent ? agent.id : null,
+        })
+        return okResult(verified)
       }
 
       if (toolName === 'chat_inference') {
         if (!agent) {
           return okResult({
             error: 'Authentication required',
-            hint: `Register keyless via POST ${origin}/v1/agents/register (includes 10 free calls on switch402/instant-test) and pass Authorization: Bearer <ag_live_key>.`,
+            hint: 'Call the "register_agent" MCP tool first (includes 10 free starter calls) and pass apiKey.',
           })
         }
         const model = String(toolArgs.model || 'switch402/instant-test')
@@ -1052,6 +1393,7 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
           return okResult({
             mode: 'sandbox_free',
             receiptId: sbx?.receiptId,
+            receiptUrl: `${origin}/v1/receipts/${sbx?.receiptId}`,
             costUsd: '0.000000',
             sandboxCallsRemaining: sbx?.remainingSandboxCalls ?? 0,
             reply: houseRes.responseObj?.choices?.[0]?.message?.content ?? houseRes.responseObj,
@@ -1066,8 +1408,8 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
             spendableUsd: nanoToUsd(agent.spendableNano),
             requiredReserveUsd: nanoToUsd(reserveNano),
             topupOptions: {
+              lightningInstant: 'Call deposit_lightning(amountUsd=0.10) then verify_lightning_deposit(invoiceId)',
               x402: `POST ${origin}/v1/wallet/topup/x402?amountUsd=1.00`,
-              lightning: `POST ${origin}/v1/wallet/deposit/lightning`,
               earnFree: `npx switch402 serve --server ${origin} --auto-ollama`,
             },
           })
@@ -1076,6 +1418,7 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
         return okResult({
           mode: out.mode,
           receiptId: out.settlement.receiptId,
+          receiptUrl: `${origin}/v1/receipts/${out.settlement.receiptId}`,
           costUsd: nanoToUsd(out.settlement.grossNano, 6),
           reply: out.responseObj?.choices?.[0]?.message?.content ?? out.responseObj,
         })
@@ -1085,32 +1428,58 @@ async function handleRemoteMcp(req, res, { ledger, house, router, payments, hear
         if (!agent) {
           return okResult({
             error: 'Authentication required',
-            hint: `Register keyless via POST ${origin}/v1/agents/register or call POST ${origin}/v1/act/${encodeURIComponent(String(toolArgs.skill || ''))} with x402 PAYMENT-SIGNATURE.`,
+            hint: 'Call the "register_agent" MCP tool first (includes 10 free starter calls) and pass apiKey!',
           })
         }
         const skill = String(toolArgs.skill || '').replace(/^act:/, '')
         const input = toolArgs.input || {}
-        const reserveNano = router.estimateBuyerReserveNano(`act:${skill}`, input)
-        const reservationId = ledger.reserve(agent.id, reserveNano, 'call')
-        if (!reservationId) {
+        return okResult(await runActForMcpAgent(agent, skill, input))
+      }
+
+      if (toolName === 'trade_decide') {
+        if (!agent) {
           return okResult({
-            error: 'Payment required (insufficient balance)',
-            spendableUsd: nanoToUsd(agent.spendableNano),
-            requiredReserveUsd: nanoToUsd(reserveNano),
-            topupOptions: {
-              x402: `POST ${origin}/v1/wallet/topup/x402?amountUsd=1.00`,
-              lightning: `POST ${origin}/v1/wallet/deposit/lightning`,
-              earnFree: `npx switch402 serve --server ${origin} --auto-ollama`,
-            },
+            error: 'Authentication required',
+            hint: 'Call the "register_agent" MCP tool first (includes 10 free starter calls) and pass apiKey!',
           })
         }
-        const out = await router.routeAct({ buyerId: agent.id, reservationId, skill, input })
+        const symbol = String(toolArgs.symbol || 'ETH-USD')
+        const interval = String(toolArgs.interval || '5m')
+        const hasDeterministicCandles = Array.isArray(toolArgs.candles)
+        const quoteRes = hasDeterministicCandles
+          ? null
+          : await runActForMcpAgent(agent, 'market.quote', { symbol })
+        if (quoteRes && !quoteRes.ok) return okResult(quoteRes)
+
+        const sigRes = await runActForMcpAgent(agent, 'trade.signal', {
+          symbol,
+          interval,
+          ...(hasDeterministicCandles ? { candles: toolArgs.candles } : {}),
+        })
+        if (!sigRes.ok) return okResult(sigRes)
+
+        const notaryRes = await runActForMcpAgent(agent, 'trade.notarize', {
+          payload: {
+            symbol: sigRes.output?.symbol || symbol,
+            interval,
+            quoteMidUsd: quoteRes?.output?.midUsd ?? sigRes.output?.indicators?.price ?? null,
+            action: sigRes.output?.action,
+            regime: sigRes.output?.regime,
+            confidence: sigRes.output?.confidence,
+            indicators: sigRes.output?.indicators,
+          },
+          note: 'mcp:trade_decide',
+        })
+
         return okResult({
           ok: true,
-          mode: out.mode,
-          receiptId: out.settlement.receiptId,
-          costUsd: nanoToUsd(out.settlement.grossNano, 6),
-          output: out.output,
+          symbol: sigRes.output?.symbol || symbol,
+          quote: quoteRes?.output || null,
+          signal: sigRes.output,
+          notarization: notaryRes.ok ? notaryRes.output : null,
+          proofReceiptId: notaryRes.ok ? notaryRes.receiptId : sigRes.receiptId,
+          proofReceiptUrl: notaryRes.ok ? notaryRes.receiptUrl : sigRes.receiptUrl,
+          sandboxCallsRemaining: notaryRes.ok ? notaryRes.sandboxCallsRemaining : sigRes.sandboxCallsRemaining,
         })
       }
 

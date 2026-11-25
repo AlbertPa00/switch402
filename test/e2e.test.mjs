@@ -440,6 +440,9 @@ test('3. Multi-rail payments: x402 v2 keyless call, replay block, Lightning HMAC
     assert.ok(openApi.paths['/mcp'].post)
     assert.ok(openApi.paths['/v1/agents/register'].post)
     assert.ok(openApi.paths['/.well-known/x402'].get)
+    assert.ok(openApi.paths['/.well-known/api-catalog'].get)
+    const catalog = await (await fetch(`${url}/.well-known/api-catalog`)).json()
+    assert.ok(Array.isArray(catalog.linkset) && catalog.linkset[0]['service-desc'])
 
     assert.equal(app.ledger.verifyInvariant().balanced, true)
   } finally {
