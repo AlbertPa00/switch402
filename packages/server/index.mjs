@@ -864,6 +864,30 @@ async function handleHttpRequest(req, res, ctx) {
     return
   }
 
+  if (method === 'GET' && pathname === '/v1/commons/donate') {
+    const challenge = payments.buildX402Challenge({
+      pathAndQuery: pathname + url.search,
+      name: 'commons_donate',
+      method: 'POST',
+      description: 'Donate Base USDC to the Switch402 Agent Commons Pool (80% Commons / 20% Maintainer)',
+      requiredNano: usdToNano('0.10'),
+    })
+    sendJson(res, 402, challenge.body, challenge.headers)
+    return
+  }
+
+  if (method === 'GET' && pathname === '/v1/commons/patron') {
+    const challenge = payments.buildX402Challenge({
+      pathAndQuery: pathname + url.search,
+      name: 'commons_patron',
+      method: 'POST',
+      description: 'Sponsor an automated Community Patron Spotlight ($1.00+, 50% Commons / 50% Maintainer)',
+      requiredNano: usdToNano('1.00'),
+    })
+    sendJson(res, 402, challenge.body, challenge.headers)
+    return
+  }
+
   if (method === 'POST' && pathname === '/v1/commons/donate') {
     const body = await readJsonBody(req)
     const rawAmt = body.amountUsd ?? url.searchParams.get('amountUsd') ?? '0.10'
@@ -922,6 +946,20 @@ async function handleHttpRequest(req, res, ctx) {
     }
     if (amountNano < usdToNano('1.00')) {
       sendJson(res, 400, { error: 'Patron Spotlight requires at least $1.00 USD' })
+      return
+    }
+    const hasAuthOrPay = Boolean(
+      req.headers.authorization || req.headers['payment-signature'] || req.headers['x-payment']
+    )
+    if (!hasAuthOrPay && !body.name && !body.tagline && !body.url) {
+      const challenge = payments.buildX402Challenge({
+        pathAndQuery: pathname + url.search,
+        name: 'commons_patron',
+        method: 'POST',
+        description: 'Sponsor an automated Community Patron Spotlight ($1.00+, 50% Commons / 50% Maintainer)',
+        requiredNano: amountNano,
+      })
+      sendJson(res, 402, challenge.body, challenge.headers)
       return
     }
     if (!String(body.name || '').trim() || !String(body.tagline || '').trim()) {
