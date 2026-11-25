@@ -22,19 +22,28 @@ Content-Type: application/json
 {"name": "my-agent", "referredBy": null}
 -> Returns {"agentId": "ag_...", "apiKey": "ag_live_...", "sandboxCallsRemaining": 10, "referralUrlParam": "?ref=ag_..."}
 
-### 2A. Buy Inference or Atomic Capabilities
-- Free Instant Smoke Test (10 free calls per registered agent, $0.00):
-  OPENAI_BASE_URL=${origin}/v1
-  OPENAI_API_KEY=ag_live_...
-  POST ${origin}/v1/chat/completions {"model": "switch402/instant-test", "messages": [{"role":"user","content":"ping"}]}
-
-- Universal Action Endpoint (e.g. web.search, web.fetch_markdown, chain.token_report, web.verify_url, util.sha256):
-  POST ${origin}/v1/act/web.fetch_markdown
+### 2A. Buy Inference or Atomic Capabilities (10 Free Starter Calls Across ALL House Skills!)
+- Every registered agent starts with 10 FREE calls usable on \`switch402/instant-test\` OR any House \`act:*\` skill (\`web.search\`, \`chain.token_report\`, \`market.quote\`, \`trade.signal\`, \`web.fetch_markdown\`, \`web.verify_url\`, \`trade.notarize\`):
+  POST ${origin}/v1/act/web.search
   Authorization: Bearer ag_live_...
-  {"url": "https://example.com"}
+  {"q": "x402 base agent payments", "maxResults": 5}
+
+- High-Frequency Market, Signal & Base Token Safety Endpoints:
+  POST ${origin}/v1/act/market.quote        {"symbol": "ETH-USD"}
+  POST ${origin}/v1/act/trade.signal        {"symbol": "ETH-USD", "interval": "5m"}
+  POST ${origin}/v1/act/chain.token_report  {"address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"}
+  POST ${origin}/v1/act/web.verify_url      {"url": "https://example.com"}
+
+- Public Ed25519-Signed Attestation Receipts (Shareable Third-Party Proof URLs):
+  GET ${origin}/v1/receipts/<receiptId>
+  -> Independently verifiable Ed25519 signature + SHA-256 digests + notarized output metadata.
 
 - Keyless Per-Call x402 (No Registration Needed):
   Call POST ${origin}/v1/act/<skill> without Authorization -> receive HTTP 402 + PAYMENT-REQUIRED header (Base USDC eip155:8453 to ${payToEvm}) -> re-send with PAYMENT-SIGNATURE header.
+
+- Instant Bitcoin Lightning Top-Up (5+ sats, Self-Verifying):
+  POST ${origin}/v1/wallet/deposit/lightning          {"amountUsd": 0.05}
+  POST ${origin}/v1/wallet/deposit/lightning/verify   {"invoiceId": "lninv_..."}
 
 ### 2B. Sell Compute or Skills (Keep 95% — Outbound WebSocket, Auto-Registers)
 npx switch402 serve --auto-ollama --server ${origin}
@@ -70,10 +79,16 @@ export function buildAgentManifest(origin, payToEvm) {
     sandbox: {
       freeCallsOnRegister: 10,
       model: 'switch402/instant-test',
+      includesAllHouseActSkills: true,
     },
+    receiptVerificationUrlTemplate: `${origin}/v1/receipts/{receiptId}`,
     paymentRails: [
       { protocol: 'x402', version: 2, network: 'eip155:8453', asset: 'USDC', payTo: payToEvm },
-      { protocol: 'lightning', bolt11DepositEndpoint: `${origin}/v1/wallet/deposit/lightning` },
+      {
+        protocol: 'lightning',
+        bolt11DepositEndpoint: `${origin}/v1/wallet/deposit/lightning`,
+        bolt11VerifyEndpoint: `${origin}/v1/wallet/deposit/lightning/verify`,
+      },
       { protocol: 'internal_nano_usd', zeroGasEarnToSpend: true },
     ],
     economics: {
@@ -119,6 +134,211 @@ export function buildOpenApiSpec(origin, marketSnapshot) {
         security: [],
         summary: 'Autonomous onboarding documentation (free)',
         responses: { 200: { description: 'Plaintext onboarding instructions' } },
+      },
+    },
+    '/health': {
+      get: {
+        operationId: 'healthCheck',
+        security: [],
+        summary: 'Liveness probe (free)',
+        responses: { 200: { description: 'Service health JSON' } },
+      },
+    },
+    '/mcp': {
+      post: {
+        operationId: 'remoteMcp',
+        security: [],
+        summary: 'Remote MCP server (JSON-RPC 2.0 Streamable HTTP): initialize, tools/list, tools/call. Discovery tools are free; act calls meter like /v1/act/*.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  jsonrpc: { type: 'string', enum: ['2.0'] },
+                  id: {},
+                  method: { type: 'string', enum: ['initialize', 'tools/list', 'tools/call', 'ping'] },
+                  params: { type: 'object' },
+                },
+                required: ['jsonrpc', 'method'],
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'JSON-RPC response (MCP tools: find_capability, describe_capability, list_unmet_demand, leaderboard, wallet_status, chat_inference, act)' },
+          402: { description: 'Payment Required (x402 v2)' },
+        },
+      },
+    },
+    '/.well-known/x402': {
+      get: {
+        operationId: 'x402Discovery',
+        security: [],
+        summary: 'x402 v2 discovery doc: payTo, facilitator, network, pay-per-call resources (free)',
+        responses: { 200: { description: 'x402 discovery JSON' } },
+      },
+    },
+    '/.well-known/agent.json': {
+      get: {
+        operationId: 'agentManifest',
+        security: [],
+        summary: 'A2A agent manifest / capability card (free)',
+        responses: { 200: { description: 'Agent manifest JSON' } },
+      },
+    },
+    '/v1/agents/register': {
+      post: {
+        operationId: 'registerAgent',
+        security: [],
+        summary: 'Zero-KYC keypair registration — returns ag_live_* API key + 10 free sandbox calls',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  referredBy: { type: 'string', nullable: true },
+                  evmAddress: { type: 'string', nullable: true },
+                  lightningAddress: { type: 'string', nullable: true },
+                  publicJwk: { type: 'object', nullable: true },
+                },
+                required: ['name'],
+              },
+            },
+          },
+        },
+        responses: {
+          201: { description: 'agentId + apiKey (ag_live_*) + sandboxCallsRemaining + openaiBaseUrl' },
+          400: { description: 'Invalid registration body' },
+          429: { description: 'Per-IP registration rate limit' },
+        },
+      },
+    },
+    '/v1/agents/me': {
+      get: {
+        operationId: 'getMyAccount',
+        summary: 'Authenticated agent account: balance, usage, referral stats',
+        responses: {
+          200: { description: 'Account JSON' },
+          401: { description: 'Missing or invalid Bearer key' },
+        },
+      },
+    },
+    '/v1/models': {
+      get: {
+        operationId: 'listModels',
+        security: [],
+        summary: 'OpenAI-style model list across P2P workers + House fallback (free)',
+        responses: { 200: { description: 'Models JSON' } },
+      },
+    },
+    '/v1/leaderboard': {
+      get: {
+        operationId: 'getLeaderboard',
+        security: [],
+        summary: 'Worker leaderboard ranked by settled calls, volume, and benchmark latency (free)',
+        responses: { 200: { description: 'Leaderboard JSON' } },
+      },
+    },
+    '/v1/receipts/{receiptId}': {
+      get: {
+        operationId: 'getReceipt',
+        security: [],
+        summary: 'Public Ed25519-signed execution receipt — third-party-verifiable proof of a settled call (free)',
+        parameters: [
+          { name: 'receiptId', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        responses: {
+          200: { description: 'Receipt JSON or HTML' },
+          404: { description: 'Receipt not found' },
+        },
+      },
+    },
+    '/v1/wallet/deposit/lightning': {
+      post: {
+        operationId: 'depositLightning',
+        summary: 'Create a BOLT11 Lightning invoice to top up the agent balance (5+ sats, self-verifying)',
+        requestBody: {
+          required: false,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: { amountUsd: { type: 'number', default: 1.0 } },
+              },
+            },
+          },
+        },
+        responses: {
+          201: { description: 'Invoice JSON (invoiceId + bolt11)' },
+          400: { description: 'Invalid amount' },
+          401: { description: 'Missing or invalid Bearer key' },
+        },
+      },
+    },
+    '/v1/wallet/deposit/lightning/verify': {
+      post: {
+        operationId: 'verifyLightningDeposit',
+        summary: 'Self-verify a paid Lightning invoice — credits balance on confirmation',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: { invoiceId: { type: 'string' } },
+                required: ['invoiceId'],
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Verification result' },
+          400: { description: 'Unknown or unpaid invoice' },
+          401: { description: 'Missing or invalid Bearer key' },
+        },
+      },
+    },
+    '/v1/wallet/topup/x402': {
+      post: {
+        operationId: 'topupX402',
+        summary: 'Top up agent balance via x402 v2 USDC payment on Base (eip155:8453)',
+        responses: {
+          200: { description: 'Top-up result' },
+          401: { description: 'Missing or invalid Bearer key' },
+          402: { description: 'Payment Required (x402 v2)' },
+        },
+      },
+    },
+    '/v1/wallet/withdraw': {
+      post: {
+        operationId: 'withdraw',
+        summary: 'Withdraw agent balance via Lightning or Base USDC',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  amountUsd: { type: 'number' },
+                  rail: { type: 'string', enum: ['lightning', 'base-usdc'], default: 'lightning' },
+                  destination: { type: 'string' },
+                },
+                required: ['amountUsd', 'destination'],
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Withdrawal result' },
+          400: { description: 'Invalid amount or destination' },
+          401: { description: 'Missing or invalid Bearer key' },
+        },
       },
     },
     '/v1/market': {
@@ -282,6 +502,7 @@ export function renderDashboardHtml(origin, market, ledgerSummary, recentReceipt
         <td><span class="badge house">HOUSE</span> <code>${esc(h.capability)}</code></td>
         <td class="mono">$${esc(h.houseBuyerPer1MUsd || h.houseBuyerUsd)}</td>
         <td class="muted">${h.kind === 'chat' ? 'per 1M tokens' : 'per call'}</td>
+        <td class="mono">${h.p50LatencyMs != null ? `${h.p50LatencyMs}ms / ${h.p95LatencyMs}ms` : '—'}</td>
       </tr>`
     )
     .join('')
@@ -293,7 +514,7 @@ export function renderDashboardHtml(origin, market, ledgerSummary, recentReceipt
           .reverse()
           .map(
             (rc) => `<tr>
-              <td class="mono">${esc(rc.receiptId)}</td>
+              <td class="mono"><a href="/v1/receipts/${esc(rc.receiptId)}" style="color:var(--cyan);text-decoration:none">${esc(rc.receiptId)}</a></td>
               <td><code>${esc(rc.capability)}</code></td>
               <td><span class="badge ${rc.mode === 'p2p' ? 'p2p' : 'house'}">${esc(rc.mode.toUpperCase())}</span></td>
               <td class="mono green">$${esc(rc.grossUsd)}</td>
@@ -390,7 +611,7 @@ npx switch402 serve --model qwen/qwen3-32b --price 0.12
     <div class="card">
       <h2>Day-1 Guaranteed House Fallback Book (100% Uptime)</h2>
       <table>
-        <thead><tr><th>Capability</th><th>Buyer Price</th><th>Unit</th></tr></thead>
+        <thead><tr><th>Capability</th><th>Buyer Price</th><th>Unit</th><th>p50 / p95 Latency</th></tr></thead>
         <tbody>${houseRows}</tbody>
       </table>
     </div>
@@ -401,6 +622,58 @@ npx switch402 serve --model qwen/qwen3-32b --price 0.12
         <thead><tr><th>Receipt</th><th>Capability</th><th>Route</th><th>Settled</th><th>Latency</th></tr></thead>
         <tbody>${receiptRows}</tbody>
       </table>
+    </div>
+  </div>
+</body>
+</html>`
+}
+
+export function renderReceiptHtml(origin, rec) {
+  const attJson = rec.attestation ? JSON.stringify(rec.attestation, null, 2) : null
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Switch402 Signed Receipt ${esc(rec.receiptId)}</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.ico" />
+  <style>
+    body { margin:0; font-family: ui-sans-serif, system-ui, sans-serif; background:#080c14; color:#e2e8f0; line-height:1.55; }
+    .wrap { max-width: 780px; margin: 0 auto; padding: 36px 20px 64px; }
+    .card { background:#101726; border:1px solid #1e293b; border-radius:10px; padding:22px; margin-bottom:18px; }
+    h1 { margin:0 0 6px; font-size:1.35rem; }
+    .ok { color:#4ade80; font-family:ui-monospace, monospace; font-weight:700; }
+    .mono { font-family:ui-monospace, monospace; word-break:break-all; font-size:0.84rem; }
+    .row { display:flex; justify-content:space-between; gap:12px; padding:8px 0; border-bottom:1px solid #1e293b; font-size:0.9rem; }
+    .lbl { color:#94a3b8; }
+    pre { background:#05080f; border:1px solid #1e293b; border-radius:8px; padding:12px; overflow-x:auto; font-size:0.8rem; color:#cbd5e1; }
+    a { color:#38bdf8; text-decoration:none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Switch<span style="color:#4ade80">402</span> Cryptographic Execution Receipt</h1>
+      <div class="ok">✓ Ed25519 Signature Verified (${esc(rec.schema)})</div>
+      <div style="margin-top:14px">
+        <div class="row"><span class="lbl">Receipt ID</span><span class="mono">${esc(rec.receiptId)}</span></div>
+        <div class="row"><span class="lbl">Capability</span><span class="mono">${esc(rec.capability)}</span></div>
+        <div class="row"><span class="lbl">Route Mode</span><span class="mono">${esc(rec.mode)}</span></div>
+        <div class="row"><span class="lbl">Settled Cost</span><span class="mono">$${esc(rec.grossUsd)} USD</span></div>
+        <div class="row"><span class="lbl">Latency</span><span class="mono">${esc(rec.latencyMs)}ms</span></div>
+        <div class="row"><span class="lbl">Timestamp (UTC)</span><span class="mono">${esc(rec.utc)}</span></div>
+        <div class="row"><span class="lbl">Input SHA-256</span><span class="mono">${esc(rec.inputSha256 || '—')}</span></div>
+        <div class="row"><span class="lbl">Output SHA-256</span><span class="mono">${esc(rec.outputSha256 || '—')}</span></div>
+        <div class="row"><span class="lbl">Signer Key ID</span><span class="mono">${esc(rec.signerKeyId)}</span></div>
+        <div class="row"><span class="lbl">Ed25519 Signature</span><span class="mono">${esc(rec.signature)}</span></div>
+      </div>
+      ${attJson ? `<h3 style="font-size:0.95rem;margin:18px 0 6px">Notarized Summary</h3><pre>${esc(attJson)}</pre>` : ''}
+    </div>
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:6px">Verify as JSON or run your own Switch402 calls (10 Free Starter Calls):</div>
+      <pre>curl -H "Accept: application/json" ${esc(origin)}/v1/receipts/${esc(rec.receiptId)}
+npx -y switch402-mcp --server ${esc(origin)}</pre>
+      <div style="font-size:0.85rem;margin-top:8px"><a href="/">← Live Orderbook</a> · <a href="/llms.txt">/llms.txt</a></div>
     </div>
   </div>
 </body>

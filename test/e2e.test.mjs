@@ -14,12 +14,16 @@ import {
   sha256Hex,
   signEd25519,
   usdToNano,
+  verifyEd25519,
 } from '../packages/protocol/index.mjs'
 import { createSwitchServer } from '../packages/server/index.mjs'
 import { SwitchWorker } from '../packages/cli/worker.mjs'
 import {
   parseDuckDuckGoLiteResults,
   buildTokenReport,
+  computeTradeSignalFromCandles,
+  normalizeMarketSymbol,
+  canonicalJsonString,
 } from '../packages/server/upstream.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -432,6 +436,10 @@ test('3. Multi-rail payments: x402 v2 keyless call, replay block, Lightning HMAC
     const openApi = await openApiRes.json()
     assert.equal(openApi.openapi, '3.1.0')
     assert.ok(openApi.paths['/v1/act/util.sha256'])
+    // Discovery surface must advertise the live MCP + registration + x402 routes
+    assert.ok(openApi.paths['/mcp'].post)
+    assert.ok(openApi.paths['/v1/agents/register'].post)
+    assert.ok(openApi.paths['/.well-known/x402'].get)
 
     assert.equal(app.ledger.verifyInvariant().balanced, true)
   } finally {
@@ -486,7 +494,7 @@ test('4. Meta-MCP stdio server full JSON-RPC handshake & live capability executi
 
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`)
     const listRes = await waitForId(2)
-    assert.equal(listRes.result.tools.length, 7)
+    assert.equal(listRes.result.tools.length, 10)
 
     child.stdin.write(
       `${JSON.stringify({
@@ -929,6 +937,204 @@ test('8. House skills: web.search + chain.token_report pricing, validation & off
     assert.equal(app.ledger.verifyInvariant().balanced, true)
   } finally {
     await app.close()
+  }
+})
+
+test('9. Usage & monetization engine: sandbox-on-act, Ed25519 public receipts, Coinos pull-verify, x402 pre-guard, trade.signal canary & zero-header remote MCP', async () => {
+  // Spin up a local mock Coinos server to verify live Lightning invoice creation + pull-verification
+  let coinosPaid = false
+  const mockCoinos = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json')
+    if (req.method === 'POST' && req.url === '/invoice') {
+      res.end(JSON.stringify({ hash: 'mock_ln_hash_999', text: 'lnbc50n1p_real_coinos_bolt11' }))
+      return
+    }
+    if (req.method === 'GET' && req.url.startsWith('/invoice/')) {
+      res.end(
+        JSON.stringify({
+          hash: 'mock_ln_hash_999',
+          confirmed: coinosPaid,
+          received: coinosPaid ? 500 : 0,
+        })
+      )
+      return
+    }
+    res.statusCode = 404
+    res.end(JSON.stringify({ error: 'not found' }))
+  })
+  await new Promise((r) => mockCoinos.listen(0, '127.0.0.1', r))
+  const coinosPort = mockCoinos.address().port
+  const coinosUrl = `http://127.0.0.1:${coinosPort}`
+
+  const app = createSwitchServer({
+    heartbeatEnabled: false,
+    coinosApiUrl: coinosUrl,
+    coinosApiToken: 'test_coinos_jwt',
+    customX402Verifier: async () => {
+      throw new Error('x402 verifier MUST NOT be invoked when capability is unavailable!')
+    },
+  })
+  const { url } = await app.listen(0)
+
+  try {
+    // 9A. Pure quantitative engine & symbol normalization checks
+    assert.deepEqual(normalizeMarketSymbol('eth/usdt'), {
+      normalized: 'ETH-USD',
+      base: 'ETH',
+      quote: 'USD',
+      binanceSymbol: 'ETHUSDT',
+      coinbaseProduct: 'ETH-USD',
+    })
+    const upCandles = Array.from({ length: 30 }, (_, i) => 100 + i * 2)
+    const upSig = computeTradeSignalFromCandles(upCandles, { symbol: 'ETH-USD', interval: '5m' })
+    assert.equal(upSig.symbol, 'ETH-USD')
+    assert.ok(upSig.indicators.ema9 > upSig.indicators.ema21)
+    assert.equal(canonicalJsonString({ z: 1, a: 2 }), '{"a":2,"z":1}')
+
+    // 9B. Keyless x402 pre-payment guard: calling an unroutable LLM model with PAYMENT-SIGNATURE returns 503 BEFORE settling USDC!
+    const unroutableX402 = await postJson(
+      `${url}/v1/chat/completions`,
+      { model: 'openai/gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      { 'PAYMENT-SIGNATURE': 'eyJ4NDAyVmVyc2lvbiI6Mn0=' }
+    )
+    assert.equal(unroutableX402.status, 503)
+    assert.match(unroutableX402.body.error.message, /NOT settled/)
+
+    // 9C. Zero-header Remote MCP (`POST /mcp`): register_agent -> trade_decide (sandbox_free!) -> get_receipt (Ed25519 verified!)
+    const mcpReg = await postJson(`${url}/mcp`, {
+      jsonrpc: '2.0',
+      id: 10,
+      method: 'tools/call',
+      params: { name: 'register_agent', arguments: { name: 'claude-remote-user' } },
+    })
+    const mcpAgent = JSON.parse(mcpReg.body.result.content[0].text)
+    assert.ok(mcpAgent.apiKey.startsWith('ag_live_'))
+    assert.equal(mcpAgent.sandboxCallsRemaining, 10)
+
+    const mcpDecide = await postJson(`${url}/mcp`, {
+      jsonrpc: '2.0',
+      id: 11,
+      method: 'tools/call',
+      params: {
+        name: 'trade_decide',
+        arguments: {
+          symbol: 'ETH-USD',
+          interval: '5m',
+          candles: upCandles,
+          apiKey: mcpAgent.apiKey,
+        },
+      },
+    })
+    const decideObj = JSON.parse(mcpDecide.body.result.content[0].text)
+    assert.equal(decideObj.ok, true)
+    assert.ok(decideObj.proofReceiptId.startsWith('rcpt_sbx_'))
+    assert.equal(decideObj.sandboxCallsRemaining, 8) // consumed 2 free starter calls (trade.signal + trade.notarize)
+
+    // Public GET /v1/receipts/:id verifies Ed25519 signature both server-side and client-side!
+    const rcptJson = await (await fetch(decideObj.proofReceiptUrl, { headers: { Accept: 'application/json' } })).json()
+    assert.equal(rcptJson.verified, true)
+    assert.equal(
+      verifyEd25519(rcptJson.signerPublicJwk, rcptJson.canonicalMessage, rcptJson.signature),
+      true
+    )
+    const rcptHtmlResp = await fetch(decideObj.proofReceiptUrl, { headers: { Accept: 'text/html' } })
+    assert.equal(rcptHtmlResp.status, 200)
+    assert.match(await rcptHtmlResp.text(), /Ed25519 Signature Verified/)
+
+    // 9D. Coinos Lightning micro-deposit ($0.005) + pull-verification credits idempotently without webhooks!
+    const lnInv = (
+      await postJson(
+        `${url}/v1/wallet/deposit/lightning`,
+        { amountUsd: 0.05 },
+        { Authorization: `Bearer ${mcpAgent.apiKey}` }
+      )
+    ).body
+    assert.equal(lnInv.bolt11, 'lnbc50n1p_real_coinos_bolt11')
+
+    // Before payment -> settled: false
+    const checkUnpaid = (
+      await postJson(
+        `${url}/v1/wallet/deposit/lightning/verify`,
+        { invoiceId: lnInv.invoiceId },
+        { Authorization: `Bearer ${mcpAgent.apiKey}` }
+      )
+    ).body
+    assert.equal(checkUnpaid.settled, false)
+
+    // Pay on Coinos -> pull-verify credits $0.0500 and replay is idempotent!
+    coinosPaid = true
+    const checkPaid = (
+      await postJson(
+        `${url}/v1/wallet/deposit/lightning/verify`,
+        { invoiceId: lnInv.invoiceId },
+        { Authorization: `Bearer ${mcpAgent.apiKey}` }
+      )
+    ).body
+    assert.equal(checkPaid.settled, true)
+    assert.equal(checkPaid.account.spendableUsd, '0.050000')
+
+    const checkPaidReplay = (
+      await postJson(
+        `${url}/v1/wallet/deposit/lightning/verify`,
+        { invoiceId: lnInv.invoiceId },
+        { Authorization: `Bearer ${mcpAgent.apiKey}` }
+      )
+    ).body
+    assert.equal(checkPaidReplay.alreadyCredited, true)
+    assert.equal(checkPaidReplay.account.spendableUsd, '0.050000')
+
+    // Now funded call settles via paid ledger path and records p50/p95 latency in /v1/market
+    const paidNotarize = await postJson(
+      `${url}/v1/act/trade.notarize`,
+      { payload: { trade: 1 } },
+      { Authorization: `Bearer ${mcpAgent.apiKey}` }
+    )
+    assert.equal(paidNotarize.status, 200)
+    assert.equal(paidNotarize.body.mode, 'house_fallback')
+    assert.ok(paidNotarize.body.receiptUrl.includes('/v1/receipts/'))
+
+    const marketSnap = await (await fetch(`${url}/v1/market`)).json()
+    const notaryBook = marketSnap.houseFallbackBook.find((x) => x.skill === 'trade.notarize')
+    assert.equal(typeof notaryBook.p50LatencyMs, 'number')
+    assert.ok(marketSnap.latencyByCapability['act:trade.notarize'].calls >= 2)
+
+    // 9E. Deterministic canary verification on `act:trade.signal`: honest seller passes, spoofing seller gets slashed & banned!
+    const honestSeller = (await postJson(`${url}/v1/agents/register`, { name: 'honest-quant' })).body
+    const honestWorker = new SwitchWorker({
+      serverUrl: url,
+      apiKey: honestSeller.apiKey,
+      autoReconnect: false,
+      capabilities: [{ capability: 'act:trade.signal', priceUsd: '0.001' }],
+      handlers: {
+        'act:trade.signal': async (inp) =>
+          computeTradeSignalFromCandles(inp.candles, { symbol: inp.symbol }),
+      },
+    })
+    await honestWorker.start()
+    const honestProbe = await app.router.runCanaryProbe(honestWorker.sessionId, 'act:trade.signal')
+    assert.equal(honestProbe.passed, true)
+    honestWorker.stop()
+
+    const fakeSeller = (await postJson(`${url}/v1/agents/register`, { name: 'fake-quant' })).body
+    const fakeWorker = new SwitchWorker({
+      serverUrl: url,
+      apiKey: fakeSeller.apiKey,
+      autoReconnect: false,
+      capabilities: [{ capability: 'act:trade.signal', priceUsd: '0.001' }],
+      handlers: {
+        'act:trade.signal': async () => ({ action: 'invalid_spoof' }),
+      },
+    })
+    await fakeWorker.start()
+    const fakeProbe = await app.router.runCanaryProbe(fakeWorker.sessionId, 'act:trade.signal')
+    assert.equal(fakeProbe.slashed, true)
+    assert.equal(app.ledger.serializeAccount(fakeSeller.agentId).banned, true)
+    fakeWorker.stop()
+
+    assert.equal(app.ledger.verifyInvariant().balanced, true)
+  } finally {
+    await app.close()
+    await new Promise((r) => mockCoinos.close(r))
   }
 })
 
