@@ -497,7 +497,7 @@ test('4. Meta-MCP stdio server full JSON-RPC handshake & live capability executi
 
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`)
     const listRes = await waitForId(2)
-    assert.equal(listRes.result.tools.length, 10)
+    assert.equal(listRes.result.tools.length, 15)
 
     child.stdin.write(
       `${JSON.stringify({
@@ -1138,6 +1138,322 @@ test('9. Usage & monetization engine: sandbox-on-act, Ed25519 public receipts, C
   } finally {
     await app.close()
     await new Promise((r) => mockCoinos.close(r))
+  }
+})
+
+test('10. Autonomous Agent Commons: 2% fee mode, Commons donations/patrons, zero-human verifiable bounties (sha256 + http_notary + requester_api + cancel), paid anti-spam inbox & WAL recovery', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sw402-commons-'))
+  const proofPages = new Map()
+  const proofServer = http.createServer((req, res) => {
+    const html = proofPages.get(req.url)
+    if (!html) {
+      res.statusCode = 404
+      res.end('Not found')
+      return
+    }
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    res.end(html)
+  })
+  await new Promise((r) => proofServer.listen(0, '127.0.0.1', r))
+  const proofPort = proofServer.address().port
+  const proofOrigin = `http://127.0.0.1:${proofPort}`
+
+  let app = createSwitchServer({
+    dataDir: tmpDir,
+    platformFeeBps: 200, // 2% protocol fee / 98% worker & recipient keep
+    heartbeatEnabled: false,
+    allowLoopbackNotaryForTest: true,
+  })
+  let { url } = await app.listen(0)
+
+  try {
+    const donor = (await postJson(`${url}/v1/agents/register`, { name: 'patron-agent' })).body
+    const reqAgent = (await postJson(`${url}/v1/agents/register`, { name: 'requester-agent' })).body
+    const workerAgent = (await postJson(`${url}/v1/agents/register`, { name: 'worker-agent' })).body
+    const inboxRecipient = (await postJson(`${url}/v1/agents/register`, { name: 'oracle-inbox' })).body
+
+    app.ledger.deposit({ agentId: donor.agentId, amountNano: usdToNano('5.00'), txId: 'c10-donor' })
+    app.ledger.deposit({ agentId: reqAgent.agentId, amountNano: usdToNano('5.00'), txId: 'c10-req' })
+    app.ledger.deposit({ agentId: workerAgent.agentId, amountNano: usdToNano('1.00'), txId: 'c10-wrk' })
+
+    // 10A. Commons donation ($0.50 -> 80% Commons Pool = $0.40, 20% Maintainer Treasury = $0.10)
+    const donRes = await postJson(
+      `${url}/v1/commons/donate`,
+      { amountUsd: 0.5, note: 'for newborn agents' },
+      { Authorization: `Bearer ${donor.apiKey}` }
+    )
+    assert.equal(donRes.status, 200)
+    assert.equal(donRes.body.toCommonsPoolUsd, '0.400000')
+    assert.equal(donRes.body.toMaintainerTreasuryUsd, '0.100000')
+    assert.equal(donRes.body.commonsPoolUsd, '0.400000')
+
+    // 10B. Patron Spotlight rejects SSRF loopback URL before charging; accepts valid public URL (50/50 split)
+    const badPatron = await postJson(
+      `${url}/v1/commons/patron`,
+      {
+        amountUsd: 1.0,
+        name: 'EvilLocal',
+        tagline: 'SSRF attempt',
+        url: 'http://127.0.0.1/secret',
+      },
+      { Authorization: `Bearer ${donor.apiKey}` }
+    )
+    assert.equal(badPatron.status, 400)
+    assert.equal(app.ledger.serializeAccount(donor.agentId).spendableUsd, '4.500000')
+
+    const goodPatron = await postJson(
+      `${url}/v1/commons/patron`,
+      {
+        amountUsd: 1.0,
+        name: 'BaseQuant Guild',
+        tagline: 'Autonomous DeFi signals & execution',
+        url: 'https://example.org/guild',
+        capabilityHint: 'act:trade.signal',
+      },
+      { Authorization: `Bearer ${donor.apiKey}` }
+    )
+    assert.equal(goodPatron.status, 201)
+    assert.equal(goodPatron.body.toCommonsPoolUsd, '0.500000')
+    assert.equal(goodPatron.body.toMaintainerTreasuryUsd, '0.500000')
+    assert.equal(goodPatron.body.commonsPoolUsd, '0.900000')
+
+    const commonsJson = await (await fetch(`${url}/v1/commons`)).json()
+    assert.equal(commonsJson.feeModel.p2pPlatformFeeBps, 200)
+    assert.equal(commonsJson.feeModel.sellerKeepBps, 9800)
+    assert.equal(commonsJson.activePatrons[0].name, 'BaseQuant Guild')
+
+    const llmsText = await (await fetch(`${url}/llms.txt`)).text()
+    assert.match(llmsText, /keep 98%/)
+    assert.match(llmsText, /BaseQuant Guild/)
+    const dashHtml = await (await fetch(`${url}/`, { headers: { Accept: 'text/html' } })).text()
+    assert.match(dashHtml, /BaseQuant Guild/)
+    assert.match(dashHtml, /98% Seller Keep/)
+
+    // 10C. Heartbeat benchmark draws from ag_commons_pool BEFORE treasuryNano
+    const hbWorker = new SwitchWorker({
+      serverUrl: url,
+      apiKey: workerAgent.apiKey,
+      autoReconnect: false,
+      capabilities: [{ capability: 'act:util.sha256', pricePerCallUsd: '0.001' }],
+      handlers: {
+        'act:util.sha256': async (inp) => ({
+          sha256: sha256Hex(String(inp.text || '')),
+          bytes: Buffer.byteLength(String(inp.text || '')),
+        }),
+      },
+    })
+    await hbWorker.start()
+    const commonsBeforeHb = app.ledger.getAgent('ag_commons_pool').spendableNano
+    const treasuryBeforeHb = app.ledger.treasuryNano
+    app.heartbeat.enabled = true
+    const hbRes = await app.heartbeat.benchmarkSession(hbWorker.sessionId)
+    app.heartbeat.enabled = false
+    assert.equal(hbRes.settled, true)
+    assert.equal(app.ledger.getAgent('ag_commons_pool').spendableNano, commonsBeforeHb - usdToNano('0.001'))
+    // Treasury only gained the 2% fee ($0.00002), did NOT pay the $0.001 benchmark subsidy!
+    assert.equal(app.ledger.treasuryNano, treasuryBeforeHb + usdToNano('0.00002'))
+    hbWorker.stop()
+
+    // 10D. Zero-human sha256_match bounty ($0.50 -> 98% = $0.49 to worker, 2% = $0.01 to treasury)
+    const secretPreimage = 'autonomous-commons-preimage-2026'
+    const shaBounty = await postJson(
+      `${url}/v1/bounties`,
+      {
+        title: 'Find sha256 preimage',
+        rewardUsd: 0.5,
+        seats: 1,
+        verifier: { type: 'sha256_match', expectedSha256: sha256Hex(secretPreimage) },
+      },
+      { Authorization: `Bearer ${reqAgent.apiKey}` }
+    )
+    assert.equal(shaBounty.status, 201)
+
+    const selfClaim = await postJson(
+      `${url}/v1/bounties/${shaBounty.body.id}/submit`,
+      { preimage: secretPreimage },
+      { Authorization: `Bearer ${reqAgent.apiKey}` }
+    )
+    assert.equal(selfClaim.status, 403)
+
+    const wrongClaim = await postJson(
+      `${url}/v1/bounties/${shaBounty.body.id}/submit`,
+      { preimage: 'wrong' },
+      { Authorization: `Bearer ${workerAgent.apiKey}` }
+    )
+    assert.equal(wrongClaim.status, 400)
+
+    const workerBalBeforeBounty = app.ledger.getAgent(workerAgent.agentId).spendableNano
+    const rightClaim = await postJson(
+      `${url}/v1/bounties/${shaBounty.body.id}/submit`,
+      { preimage: secretPreimage },
+      { Authorization: `Bearer ${workerAgent.apiKey}` }
+    )
+    assert.equal(rightClaim.status, 200)
+    assert.equal(rightClaim.body.paid, true)
+    assert.equal(rightClaim.body.workerNetUsd, '0.490000')
+    assert.equal(rightClaim.body.platformFeeUsd, '0.010000')
+    assert.equal(rightClaim.body.status, 'filled')
+    assert.equal(
+      app.ledger.getAgent(workerAgent.agentId).spendableNano,
+      workerBalBeforeBounty + usdToNano('0.49')
+    )
+    const btyReceipt = await (await fetch(rightClaim.body.receiptUrl)).json()
+    assert.equal(btyReceipt.verified, true)
+
+    // 10E. Zero-human http_notary_proof bounty ($0.20, 2 seats, requireClaimantId + anti-dupe URL)
+    const notaryBounty = await postJson(
+      `${url}/v1/bounties`,
+      {
+        title: 'Publish verified proof page',
+        rewardUsd: 0.2,
+        seats: 2,
+        verifier: {
+          type: 'http_notary_proof',
+          mustContain: 'PROOF_TOKEN_77',
+          requireClaimantId: true,
+        },
+      },
+      { Authorization: `Bearer ${reqAgent.apiKey}` }
+    )
+    assert.equal(notaryBounty.status, 201)
+
+    proofPages.set('/bad-proof', 'missing required token')
+    const badNotary = await postJson(
+      `${url}/v1/bounties/${notaryBounty.body.id}/submit`,
+      { url: `${proofOrigin}/bad-proof` },
+      { Authorization: `Bearer ${workerAgent.apiKey}` }
+    )
+    assert.equal(badNotary.status, 400)
+
+    proofPages.set('/good-proof', `Live submission PROOF_TOKEN_77 by ${workerAgent.agentId}`)
+    const goodNotary = await postJson(
+      `${url}/v1/bounties/${notaryBounty.body.id}/submit`,
+      { url: `${proofOrigin}/good-proof` },
+      { Authorization: `Bearer ${workerAgent.apiKey}` }
+    )
+    assert.equal(goodNotary.status, 200)
+    assert.equal(goodNotary.body.workerNetUsd, '0.196000')
+    assert.equal(goodNotary.body.seatsRemaining, 1)
+
+    // Another agent cannot replay the exact same URL!
+    const dupeUrlAttempt = await postJson(
+      `${url}/v1/bounties/${notaryBounty.body.id}/submit`,
+      { url: `${proofOrigin}/good-proof` },
+      { Authorization: `Bearer ${donor.apiKey}` }
+    )
+    assert.equal(dupeUrlAttempt.status, 409)
+
+    // 10F. requester_api bounty: submit -> accept 1 seat -> cancel refunds remaining 1 seat 100%
+    const apiBounty = await postJson(
+      `${url}/v1/bounties`,
+      {
+        title: 'Manual API QA check',
+        rewardUsd: 0.3,
+        seats: 2,
+        verifier: { type: 'requester_api' },
+      },
+      { Authorization: `Bearer ${reqAgent.apiKey}` }
+    )
+    assert.equal(apiBounty.status, 201)
+
+    const subPending = await postJson(
+      `${url}/v1/bounties/${apiBounty.body.id}/submit`,
+      { url: 'https://example.com', payload: { ok: true } },
+      { Authorization: `Bearer ${workerAgent.apiKey}` }
+    )
+    assert.equal(subPending.status, 200)
+    assert.equal(subPending.body.paid, false)
+
+    const accepted = await postJson(
+      `${url}/v1/bounties/${apiBounty.body.id}/accept`,
+      { submissionId: subPending.body.submission.submissionId },
+      { Authorization: `Bearer ${reqAgent.apiKey}` }
+    )
+    assert.equal(accepted.status, 200)
+    assert.equal(accepted.body.workerNetUsd, '0.294000')
+
+    const reqBalBeforeCancel = app.ledger.getAgent(reqAgent.agentId).spendableNano
+    const cancelled = await postJson(
+      `${url}/v1/bounties/${apiBounty.body.id}/cancel`,
+      {},
+      { Authorization: `Bearer ${reqAgent.apiKey}` }
+    )
+    assert.equal(cancelled.status, 200)
+    assert.equal(cancelled.body.refundedUsd, '0.300000')
+    assert.equal(app.ledger.getAgent(reqAgent.agentId).spendableNano, reqBalBeforeCancel + usdToNano('0.30'))
+
+    // 10G. Paid Anti-Spam Agent Inbox (98% to recipient, stamp threshold enforced)
+    const patchRes = await fetch(`${url}/v1/agents/me/inbox`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${inboxRecipient.apiKey}`,
+      },
+      body: JSON.stringify({ minStampUsd: '0.01' }),
+    })
+    assert.equal(patchRes.status, 200)
+
+    const lowStamp = await postJson(
+      `${url}/v1/agents/${inboxRecipient.agentId}/inbox`,
+      { subject: 'cheap spam', body: 'hello', stampUsd: '0.001' },
+      { Authorization: `Bearer ${workerAgent.apiKey}` }
+    )
+    assert.equal(lowStamp.status, 402)
+
+    const validMsg = await postJson(
+      `${url}/v1/agents/${inboxRecipient.agentId}/inbox`,
+      { subject: 'Job offer', body: 'Need quote check' },
+      { Authorization: `Bearer ${workerAgent.apiKey}` }
+    )
+    assert.equal(validMsg.status, 201)
+    assert.equal(validMsg.body.stampUsd, '0.010000')
+    assert.equal(validMsg.body.recipientNetUsd, '0.009800')
+    assert.equal(app.ledger.serializeAccount(inboxRecipient.agentId).spendableUsd, '0.009800')
+
+    // Remote MCP inbox + commons tools
+    const mcpInbox = await postJson(`${url}/mcp`, {
+      jsonrpc: '2.0',
+      id: 99,
+      method: 'tools/call',
+      params: {
+        name: 'check_inbox',
+        arguments: { unreadOnly: true, markRead: true, apiKey: inboxRecipient.apiKey },
+      },
+    })
+    const inboxData = JSON.parse(mcpInbox.body.result.content[0].text)
+    assert.equal(inboxData.messages.length, 1)
+    assert.equal(inboxData.messages[0].subject, 'Job offer')
+    assert.equal(inboxData.unreadCount, 0)
+
+    // Re-check unreadOnly -> 0 messages now!
+    const afterRead = await (
+      await fetch(`${url}/v1/agents/me/inbox?unread=true`, {
+        headers: { Authorization: `Bearer ${inboxRecipient.apiKey}` },
+      })
+    ).json()
+    assert.equal(afterRead.messages.length, 0)
+
+    assert.equal(app.ledger.verifyInvariant().balanced, true)
+
+    // 10H. Crash-safe WAL + Commons JSON persistence across full server restart
+    await app.close()
+    app = createSwitchServer({
+      dataDir: tmpDir,
+      platformFeeBps: 200,
+      heartbeatEnabled: false,
+    })
+    ;({ url } = await app.listen(0))
+
+    assert.equal(app.ledger.verifyInvariant().balanced, true)
+    assert.equal(app.ledger.serializeAccount(inboxRecipient.agentId).spendableUsd, '0.009800')
+    const persistedCommons = await (await fetch(`${url}/v1/commons`)).json()
+    assert.equal(persistedCommons.activePatrons[0].name, 'BaseQuant Guild')
+    const persistedBounties = await (await fetch(`${url}/v1/bounties?status=all`)).json()
+    assert.equal(persistedBounties.bounties.length, 3)
+  } finally {
+    await app.close()
+    await new Promise((r) => proofServer.close(r))
+    fs.rmSync(tmpDir, { recursive: true, force: true })
   }
 })
 

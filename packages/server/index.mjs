@@ -2,10 +2,11 @@ import http from 'node:http'
 import { fileURLToPath } from 'node:url'
 import { acceptWebSocketUpgrade, nanoToUsd, usdToNano } from '../protocol/index.mjs'
 import { NanoLedger } from './ledger.mjs'
-import { HouseUpstream } from './upstream.mjs'
+import { HouseUpstream, assertSafePublicUrl } from './upstream.mjs'
 import { SellerRouter, buildPublicAttestationSummary } from './router.mjs'
 import { PaymentEngine } from './payments.mjs'
 import { HeartbeatBuyer } from './heartbeat.mjs'
+import { AutonomousCommons } from './commons.mjs'
 import {
   buildAgentManifest,
   buildLlmsTxt,
@@ -76,6 +77,12 @@ export function createSwitchServer(opts = {}) {
   })
   router.onSessionRegistered = (sessionId) => heartbeat.scheduleWelcomePing(sessionId)
 
+  const commons = new AutonomousCommons({
+    ledger,
+    dataDir: opts.dataDir ?? process.env.DATA_DIR ?? null,
+    allowLoopbackNotaryForTest: Boolean(opts.allowLoopbackNotaryForTest),
+  })
+
   /** @type {Map<string, number[]>} clientIp -> registration timestamps in last hour */
   const regRateLimits = new Map()
   const maxRegistrationsPerIpPerHour = Number(
@@ -89,6 +96,7 @@ export function createSwitchServer(opts = {}) {
       router,
       payments,
       heartbeat,
+      commons,
       regRateLimits,
       maxRegistrationsPerIpPerHour,
       publicOrigin,
@@ -119,6 +127,7 @@ export function createSwitchServer(opts = {}) {
     router,
     payments,
     heartbeat,
+    commons,
     async listen(port = 0, host = '127.0.0.1') {
       await new Promise((resolve, reject) => {
         server.once('error', reject)
@@ -143,7 +152,16 @@ export function createSwitchServer(opts = {}) {
 }
 
 async function handleHttpRequest(req, res, ctx) {
-  const { ledger, house, router, payments, heartbeat, regRateLimits, maxRegistrationsPerIpPerHour } = ctx
+  const {
+    ledger,
+    house,
+    router,
+    payments,
+    heartbeat,
+    commons,
+    regRateLimits,
+    maxRegistrationsPerIpPerHour,
+  } = ctx
   const origin = payments.publicOrigin
   const url = new URL(req.url || '/', origin)
   const pathname = url.pathname
@@ -154,7 +172,7 @@ async function handleHttpRequest(req, res, ctx) {
     'Access-Control-Allow-Headers',
     'Authorization, Content-Type, PAYMENT-SIGNATURE, X-PAYMENT, X-Webhook-Signature, X-Max-Price-Usd'
   )
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS')
   if (method === 'OPTIONS') {
     res.writeHead(204)
     res.end()
@@ -165,9 +183,14 @@ async function handleHttpRequest(req, res, ctx) {
   if (method === 'GET' && pathname === '/') {
     const market = router.getMarketSnapshot()
     const summary = ledger.summary()
+    const commonsSnap = commons.getCommonsSnapshot()
     const accept = String(req.headers.accept || '')
     if (accept.includes('text/html')) {
-      const html = renderDashboardHtml(origin, market, summary, ledger.recentReceipts)
+      const html = renderDashboardHtml(origin, market, summary, ledger.recentReceipts, {
+        platformFeeBps: ledger.platformFeeBps,
+        commons: commonsSnap,
+        bounties: commons.listBounties({ status: 'open' }),
+      })
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(html)
       return
@@ -178,9 +201,12 @@ async function handleHttpRequest(req, res, ctx) {
       docs: `${origin}/llms.txt`,
       openapi: `${origin}/openapi.json`,
       mcpHttp: `${origin}/mcp`,
+      commons: `${origin}/v1/commons`,
+      bounties: `${origin}/v1/bounties`,
       leaderboard: `${origin}/v1/leaderboard`,
       workerWs: `${origin.replace(/^http/, 'ws')}/ws/worker`,
       summary,
+      commonsPoolUsd: commonsSnap.commonsPoolUsd,
       onlineWorkers: market.onlineWorkers,
     })
     return
@@ -193,14 +219,17 @@ async function handleHttpRequest(req, res, ctx) {
   }
 
   if (method === 'GET' && (pathname === '/llms.txt' || pathname === '/skill.md')) {
-    const text = buildLlmsTxt(origin, payments.payToEvm)
+    const text = buildLlmsTxt(origin, payments.payToEvm, {
+      platformFeeBps: ledger.platformFeeBps,
+      commons: commons.getCommonsSnapshot(),
+    })
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
     res.end(text)
     return
   }
 
   if (method === 'GET' && (pathname === '/.well-known/agent.json' || pathname === '/.well-known/agent-card.json')) {
-    sendJson(res, 200, buildAgentManifest(origin, payments.payToEvm))
+    sendJson(res, 200, buildAgentManifest(origin, payments.payToEvm, { platformFeeBps: ledger.platformFeeBps }))
     return
   }
 
@@ -255,6 +284,7 @@ async function handleHttpRequest(req, res, ctx) {
       router,
       payments,
       heartbeat,
+      commons,
       origin,
       regRateLimits,
       maxRegistrationsPerIpPerHour,
@@ -302,6 +332,7 @@ async function handleHttpRequest(req, res, ctx) {
     sendJson(res, 200, {
       ...router.getMarketSnapshot(),
       heartbeat: heartbeat.getSnapshot(),
+      commons: commons.getCommonsSnapshot(),
       ledger: ledger.summary(),
     })
     return
@@ -827,6 +858,300 @@ async function handleHttpRequest(req, res, ctx) {
     return
   }
 
+  // 6. Autonomous Agent Commons, Patron Spotlights, Auto-Verified Bounties & Paid Inbox
+  if (method === 'GET' && pathname === '/v1/commons') {
+    sendJson(res, 200, commons.getCommonsSnapshot())
+    return
+  }
+
+  if (method === 'POST' && pathname === '/v1/commons/donate') {
+    const body = await readJsonBody(req)
+    const rawAmt = body.amountUsd ?? url.searchParams.get('amountUsd') ?? '0.10'
+    let amountNano
+    try {
+      amountNano = usdToNano(String(rawAmt))
+    } catch (err) {
+      sendJson(res, 400, { error: err.message })
+      return
+    }
+    if (amountNano < usdToNano('0.001')) {
+      sendJson(res, 400, { error: 'Minimum donation is $0.001 USD' })
+      return
+    }
+    const authResult = await resolveBuyerAndReserve({
+      req,
+      res,
+      ledger,
+      payments,
+      pathAndQuery: pathname + url.search,
+      capabilityName: 'commons_donate',
+      method: 'POST',
+      reserveNano: amountNano,
+    })
+    if (!authResult) return
+    try {
+      ledger.releaseReservation(authResult.reservationId)
+      const result = commons.recordDonation({
+        fromAgentId: authResult.buyerId,
+        amountNano,
+        note: body.note || '',
+      })
+      sendJson(
+        res,
+        200,
+        { ...result, receiptUrl: `${origin}/v1/receipts/${result.receiptId}` },
+        authResult.paymentResponseHeader ? { 'PAYMENT-RESPONSE': authResult.paymentResponseHeader } : {}
+      )
+    } catch (err) {
+      sendJson(res, err.statusCode || 400, { error: err.message })
+    } finally {
+      if (authResult.isKeylessOmnibus) ledger.sweepAccountSpendableToTreasury(authResult.buyerId)
+    }
+    return
+  }
+
+  if (method === 'POST' && pathname === '/v1/commons/patron') {
+    const body = await readJsonBody(req)
+    const rawAmt = body.amountUsd ?? url.searchParams.get('amountUsd') ?? '1.00'
+    let amountNano
+    try {
+      amountNano = usdToNano(String(rawAmt))
+    } catch (err) {
+      sendJson(res, 400, { error: err.message })
+      return
+    }
+    if (amountNano < usdToNano('1.00')) {
+      sendJson(res, 400, { error: 'Patron Spotlight requires at least $1.00 USD' })
+      return
+    }
+    if (!String(body.name || '').trim() || !String(body.tagline || '').trim()) {
+      sendJson(res, 400, { error: 'Patron "name" and "tagline" are required' })
+      return
+    }
+    try {
+      await assertSafePublicUrl(body.url)
+    } catch (err) {
+      sendJson(res, 400, { error: `Invalid patron URL: ${err.message}` })
+      return
+    }
+    const authResult = await resolveBuyerAndReserve({
+      req,
+      res,
+      ledger,
+      payments,
+      pathAndQuery: pathname + url.search,
+      capabilityName: 'commons_patron',
+      method: 'POST',
+      reserveNano: amountNano,
+    })
+    if (!authResult) return
+    try {
+      ledger.releaseReservation(authResult.reservationId)
+      const result = await commons.registerPatron({
+        fromAgentId: authResult.buyerId,
+        amountNano,
+        name: body.name,
+        tagline: body.tagline,
+        url: body.url,
+        capabilityHint: body.capabilityHint || '',
+      })
+      sendJson(
+        res,
+        201,
+        { ...result, receiptUrl: `${origin}/v1/receipts/${result.receiptId}` },
+        authResult.paymentResponseHeader ? { 'PAYMENT-RESPONSE': authResult.paymentResponseHeader } : {}
+      )
+    } catch (err) {
+      sendJson(res, err.statusCode || 400, { error: err.message })
+    } finally {
+      if (authResult.isKeylessOmnibus) ledger.sweepAccountSpendableToTreasury(authResult.buyerId)
+    }
+    return
+  }
+
+  if (method === 'GET' && pathname === '/v1/bounties') {
+    const status = url.searchParams.get('status') || 'open'
+    sendJson(res, 200, { bounties: commons.listBounties({ status }) })
+    return
+  }
+
+  if (method === 'POST' && pathname === '/v1/bounties') {
+    const agent = authenticateBearer(req, ledger)
+    if (!agent) {
+      sendJson(res, 401, { error: 'Missing or invalid Authorization: Bearer <ag_live_key>' })
+      return
+    }
+    if (agent.banned) {
+      sendJson(res, 403, { error: 'Agent account is suspended' })
+      return
+    }
+    const body = await readJsonBody(req)
+    try {
+      const created = commons.createBounty({
+        requesterId: agent.id,
+        title: body.title,
+        description: body.description || '',
+        rewardUsd: body.rewardUsd,
+        seats: body.seats ?? 1,
+        ttlSeconds: body.ttlSeconds ?? 86_400,
+        verifier: body.verifier,
+      })
+      sendJson(res, 201, created)
+    } catch (err) {
+      sendJson(res, err.statusCode || 400, { error: err.message })
+    }
+    return
+  }
+
+  const bountyActionMatch = pathname.match(/^\/v1\/bounties\/([^/]+)\/(submit|accept|cancel)$/)
+  if (method === 'POST' && bountyActionMatch) {
+    const agent = authenticateBearer(req, ledger)
+    if (!agent) {
+      sendJson(res, 401, { error: 'Missing or invalid Authorization: Bearer <ag_live_key>' })
+      return
+    }
+    if (agent.banned) {
+      sendJson(res, 403, { error: 'Agent account is suspended' })
+      return
+    }
+    const bountyId = decodeURIComponent(bountyActionMatch[1])
+    const action = bountyActionMatch[2]
+    const body = await readJsonBody(req)
+    try {
+      let out
+      if (action === 'submit') {
+        out = await commons.submitBounty({
+          bountyId,
+          workerId: agent.id,
+          preimage: body.preimage,
+          url: body.url,
+          payload: body.payload,
+        })
+      } else if (action === 'accept') {
+        out = commons.acceptBountySubmission({
+          bountyId,
+          requesterId: agent.id,
+          submissionId: body.submissionId,
+        })
+      } else {
+        out = commons.cancelOrExpireBounty({ bountyId, callerId: agent.id })
+      }
+      if (out.receiptId) {
+        out.receiptUrl = `${origin}/v1/receipts/${out.receiptId}`
+      }
+      sendJson(res, 200, out)
+    } catch (err) {
+      sendJson(res, err.statusCode || 400, { error: err.message })
+    }
+    return
+  }
+
+  const bountyGetMatch = pathname.match(/^\/v1\/bounties\/([^/]+)$/)
+  if (method === 'GET' && bountyGetMatch) {
+    const bounty = commons.getBounty(decodeURIComponent(bountyGetMatch[1]))
+    if (!bounty) {
+      sendJson(res, 404, { error: `Unknown bounty: ${bountyGetMatch[1]}` })
+      return
+    }
+    sendJson(res, 200, bounty)
+    return
+  }
+
+  if (pathname === '/v1/agents/me/inbox' && (method === 'GET' || method === 'PATCH')) {
+    const agent = authenticateBearer(req, ledger)
+    if (!agent) {
+      sendJson(res, 401, { error: 'Missing or invalid Authorization: Bearer <ag_live_key>' })
+      return
+    }
+    if (method === 'GET') {
+      sendJson(
+        res,
+        200,
+        commons.getInbox(agent.id, {
+          unreadOnly: url.searchParams.get('unread') === 'true',
+          markRead: url.searchParams.get('markRead') === 'true',
+        })
+      )
+      return
+    }
+    const body = await readJsonBody(req)
+    try {
+      sendJson(res, 200, commons.setInboxSettings(agent.id, { minStampUsd: body.minStampUsd }))
+    } catch (err) {
+      sendJson(res, err.statusCode || 400, { error: err.message })
+    }
+    return
+  }
+
+  const inboxSendMatch = pathname.match(/^\/v1\/agents\/([^/]+)\/inbox$/)
+  if (method === 'POST' && inboxSendMatch && inboxSendMatch[1] !== 'me') {
+    const targetId = decodeURIComponent(inboxSendMatch[1])
+    const recipient = ledger.getAgent(targetId)
+    if (!recipient || !recipient.apiKeyHash) {
+      sendJson(res, 404, { error: `Unknown recipient agent: ${targetId}` })
+      return
+    }
+    if (recipient.banned) {
+      sendJson(res, 403, { error: 'Recipient agent is suspended' })
+      return
+    }
+    const body = await readJsonBody(req)
+    if (!String(body.body || '').trim()) {
+      sendJson(res, 400, { error: 'Message "body" is required' })
+      return
+    }
+    const minStamp = commons.getInboxMinStampNano(targetId)
+    let effectiveStamp = minStamp
+    if (body.stampUsd !== undefined) {
+      try {
+        effectiveStamp = usdToNano(String(body.stampUsd))
+      } catch (err) {
+        sendJson(res, 400, { error: err.message })
+        return
+      }
+    }
+    if (effectiveStamp < minStamp) {
+      sendJson(res, 402, {
+        error: `Recipient minimum anti-spam stamp is $${nanoToUsd(minStamp, 6)} USD`,
+        requiredStampUsd: nanoToUsd(minStamp, 6),
+      })
+      return
+    }
+    const authResult = await resolveBuyerAndReserve({
+      req,
+      res,
+      ledger,
+      payments,
+      pathAndQuery: pathname + url.search,
+      capabilityName: `inbox_${targetId}`,
+      method: 'POST',
+      reserveNano: effectiveStamp,
+    })
+    if (!authResult) return
+    try {
+      ledger.releaseReservation(authResult.reservationId)
+      const msgOut = commons.sendInboxMessage({
+        fromAgentId: authResult.buyerId,
+        toAgentId: targetId,
+        subject: body.subject || '',
+        body: body.body,
+        stampNano: effectiveStamp,
+        replyTo: body.replyTo || null,
+      })
+      sendJson(
+        res,
+        201,
+        { ...msgOut, receiptUrl: `${origin}/v1/receipts/${msgOut.receiptId}` },
+        authResult.paymentResponseHeader ? { 'PAYMENT-RESPONSE': authResult.paymentResponseHeader } : {}
+      )
+    } catch (err) {
+      sendJson(res, err.statusCode || 400, { error: err.message })
+    } finally {
+      if (authResult.isKeylessOmnibus) ledger.sweepAccountSpendableToTreasury(authResult.buyerId)
+    }
+    return
+  }
+
   sendJson(res, 404, {
     error: `Unknown route ${method} ${pathname}`,
     docs: `${origin}/llms.txt`,
@@ -973,7 +1298,17 @@ function sendJson(res, status, obj, extraHeaders = {}) {
 async function handleRemoteMcp(
   req,
   res,
-  { ledger, house, router, payments, heartbeat, origin, regRateLimits, maxRegistrationsPerIpPerHour }
+  {
+    ledger,
+    house,
+    router,
+    payments,
+    heartbeat,
+    commons,
+    origin,
+    regRateLimits,
+    maxRegistrationsPerIpPerHour,
+  }
 ) {
   let msg
   try {
@@ -1113,13 +1448,96 @@ async function handleRemoteMcp(
     },
     {
       name: 'list_unmet_demand',
-      description: 'Inspect capabilities hitting House Fallback so you can spin up a P2P seller worker and keep 95%.',
+      description: 'Inspect capabilities hitting House Fallback so you can spin up a P2P seller worker and earn protocol keep.',
       inputSchema: { type: 'object', properties: {} },
     },
     {
       name: 'leaderboard',
       description: 'View live P2P seller speed leaderboard and Heartbeat Benchmark status.',
       inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'commons_status',
+      description: 'View the Switch402 Agent Commons Pool balance, active Community Patrons, and fee model.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'donate_commons',
+      description: 'Donate USD from your agent balance to the public Agent Commons Pool (80% Commons / 20% Maintainer).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          amountUsd: { type: 'number', description: 'Donation amount in USD (min 0.001)' },
+          note: { type: 'string', description: 'Optional note' },
+          apiKey: { type: 'string', description: 'Optional ag_live_... key' },
+        },
+        required: ['amountUsd'],
+      },
+    },
+    {
+      name: 'list_bounties',
+      description: 'List open zero-human auto-verifiable bounties on Switch402.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', description: '"open" (default) or "all"' },
+        },
+      },
+    },
+    {
+      name: 'post_bounty',
+      description: 'Post an escrowed bounty verified automatically by sha256_match, http_notary_proof, or requester_api.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Bounty title' },
+          rewardUsd: { type: 'number', description: 'Payout per seat in USD (min 0.005)' },
+          seats: { type: 'number', description: 'Number of payable seats (default 1)' },
+          verifier: { type: 'object', description: 'Verifier specification ({ type, expectedSha256 | mustContain, ... })' },
+          apiKey: { type: 'string', description: 'Optional ag_live_... key' },
+        },
+        required: ['title', 'rewardUsd', 'verifier'],
+      },
+    },
+    {
+      name: 'submit_bounty',
+      description: 'Submit proof (preimage or public url) to an open Switch402 bounty for instant automated payout.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          bountyId: { type: 'string', description: 'Bounty ID (bty_...)' },
+          preimage: { type: 'string', description: 'Preimage string for sha256_match bounties' },
+          url: { type: 'string', description: 'Public proof URL for http_notary_proof or requester_api bounties' },
+          apiKey: { type: 'string', description: 'Optional ag_live_... key' },
+        },
+        required: ['bountyId'],
+      },
+    },
+    {
+      name: 'send_agent_message',
+      description: 'Send a paid anti-spam A2A message to any registered Switch402 agent pull inbox (recipient keeps 98%).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          toAgentId: { type: 'string', description: 'Recipient agentId (ag_...)' },
+          subject: { type: 'string', description: 'Optional subject' },
+          body: { type: 'string', description: 'Message content' },
+          apiKey: { type: 'string', description: 'Optional ag_live_... key' },
+        },
+        required: ['toAgentId', 'body'],
+      },
+    },
+    {
+      name: 'check_inbox',
+      description: 'Read incoming paid messages in your Switch402 agent pull inbox.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          unreadOnly: { type: 'boolean', description: 'Only return unread messages' },
+          markRead: { type: 'boolean', description: 'Mark retrieved messages as read' },
+          apiKey: { type: 'string', description: 'Optional ag_live_... key' },
+        },
+      },
     },
   ]
 
@@ -1331,14 +1749,99 @@ async function handleRemoteMcp(
       }
 
       if (toolName === 'list_unmet_demand') {
+        const keepPct = ((10_000 - ledger.platformFeeBps) / 100).toFixed(
+          ledger.platformFeeBps % 100 === 0 ? 0 : 2
+        )
         return okResult({
           unmetDemandFeed: snap.unmetDemandFeed,
-          tip: `Run \`npx switch402 serve --server ${origin} --model <id> --price <suggestedUndercutUsd>\` to earn 95%.`,
+          tip: `Run \`npx switch402 serve --server ${origin} --model <id> --price <suggestedUndercutUsd>\` to earn ${keepPct}%.`,
         })
       }
 
       if (toolName === 'leaderboard') {
         return okResult(heartbeat.getSnapshot())
+      }
+
+      if (toolName === 'commons_status') {
+        return okResult(commons.getCommonsSnapshot())
+      }
+
+      if (toolName === 'donate_commons') {
+        if (!agent) {
+          return okResult({
+            error: 'Authentication required',
+            hint: 'Call register_agent first and pass apiKey (after topping up), or POST /v1/commons/donate with x402.',
+          })
+        }
+        const amountNano = usdToNano(String(toolArgs.amountUsd ?? 0.1))
+        const res = commons.recordDonation({
+          fromAgentId: agent.id,
+          amountNano,
+          note: toolArgs.note || '',
+        })
+        return okResult({ ...res, receiptUrl: `${origin}/v1/receipts/${res.receiptId}` })
+      }
+
+      if (toolName === 'list_bounties') {
+        return okResult({
+          bounties: commons.listBounties({ status: toolArgs.status || 'open' }),
+        })
+      }
+
+      if (toolName === 'post_bounty') {
+        if (!agent) {
+          return okResult({ error: 'Authentication required', hint: 'Pass apiKey or Authorization header.' })
+        }
+        return okResult(
+          commons.createBounty({
+            requesterId: agent.id,
+            title: toolArgs.title,
+            description: toolArgs.description || '',
+            rewardUsd: toolArgs.rewardUsd,
+            seats: toolArgs.seats ?? 1,
+            verifier: toolArgs.verifier,
+          })
+        )
+      }
+
+      if (toolName === 'submit_bounty') {
+        if (!agent) {
+          return okResult({ error: 'Authentication required', hint: 'Pass apiKey or Authorization header.' })
+        }
+        const out = await commons.submitBounty({
+          bountyId: toolArgs.bountyId,
+          workerId: agent.id,
+          preimage: toolArgs.preimage,
+          url: toolArgs.url,
+          payload: toolArgs.payload,
+        })
+        if (out.receiptId) out.receiptUrl = `${origin}/v1/receipts/${out.receiptId}`
+        return okResult(out)
+      }
+
+      if (toolName === 'send_agent_message') {
+        if (!agent) {
+          return okResult({ error: 'Authentication required', hint: 'Pass apiKey or Authorization header.' })
+        }
+        const msgOut = commons.sendInboxMessage({
+          fromAgentId: agent.id,
+          toAgentId: toolArgs.toAgentId,
+          subject: toolArgs.subject || '',
+          body: toolArgs.body,
+        })
+        return okResult({ ...msgOut, receiptUrl: `${origin}/v1/receipts/${msgOut.receiptId}` })
+      }
+
+      if (toolName === 'check_inbox') {
+        if (!agent) {
+          return okResult({ error: 'Authentication required', hint: 'Pass apiKey or Authorization header.' })
+        }
+        return okResult(
+          commons.getInbox(agent.id, {
+            unreadOnly: Boolean(toolArgs.unreadOnly),
+            markRead: Boolean(toolArgs.markRead),
+          })
+        )
       }
 
       if (toolName === 'wallet_status') {

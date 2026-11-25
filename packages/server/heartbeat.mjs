@@ -125,7 +125,18 @@ export class HeartbeatBuyer {
     const buyerAcct = this.ledger.getAgent(this.buyerId)
     if (buyerAcct.spendableNano < neededNano) {
       const deficit = neededNano - buyerAcct.spendableNano
-      if (this.ledger.treasuryNano >= deficit) {
+      const commonsAcct = this.ledger.getAgent('ag_commons_pool')
+      if (commonsAcct && commonsAcct.spendableNano >= deficit) {
+        this.ledger.transferWithFee({
+          fromAgentId: 'ag_commons_pool',
+          toAgentId: this.buyerId,
+          amountNano: deficit,
+          feeBps: 0,
+          kind: 'commons_subsidy',
+          capability: 'commons:heartbeat',
+          countAsVolume: false,
+        })
+      } else if (this.ledger.treasuryNano >= deficit) {
         this.ledger.reinvestTreasuryToBuyer(this.buyerId, deficit)
       } else if (canUseBootstrapGrant) {
         this.ledger.deposit({

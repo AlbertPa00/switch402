@@ -14,6 +14,8 @@ primary_region = "iad"
   X402_FACILITATOR_URL = "https://facilitator.payai.network"
   HEARTBEAT_ENABLED = "true"
   HEARTBEAT_DAILY_USD = "0.14"
+  PLATFORM_FEE_BPS = "200"
+  MAX_REG_PER_IP_HOUR = "10"
 
 [mounts]
   source = "switch402_data"

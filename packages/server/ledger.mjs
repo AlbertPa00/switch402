@@ -72,6 +72,10 @@ export class NanoLedger {
     this.receiptSigner = this._initReceiptSigner()
 
     this._walFd = null
+    // Ensure protocol commons & escrow system accounts exist before WAL replay
+    this.ensureSystemAccount('ag_commons_pool', '_switch402_commons_pool')
+    this.ensureSystemAccount('ag_bounty_escrow', '_switch402_bounty_escrow')
+
     if (this.dataDir) {
       fs.mkdirSync(this.dataDir, { recursive: true })
       this._loadFromDisk()
@@ -472,6 +476,85 @@ export class NanoLedger {
       wholesaleNano: split.wholesaleNano,
       platformNano: split.platformNetMarginNano,
       referrerNano: split.referrerNano,
+    }
+  }
+
+  /**
+   * Atomically transfer spendable nano-USD between two accounts with an optional protocol fee
+   * and automatic third-party referrer split (preserves exact double-entry conservation).
+   */
+  transferWithFee({
+    fromAgentId,
+    toAgentId,
+    amountNano,
+    feeBps = 0,
+    kind = 'transfer',
+    capability = null,
+    memo = '',
+    countAsVolume = true,
+  }) {
+    if (fromAgentId === toAgentId) throw new Error('Self-dealing prohibited')
+    const amt = BigInt(amountNano)
+    if (amt <= 0n) throw new Error('Transfer amount must be positive')
+    const from = this.accounts.get(fromAgentId)
+    const to = this.accounts.get(toAgentId)
+    if (!from) throw new Error(`Unknown sender: ${fromAgentId}`)
+    if (!to) throw new Error(`Unknown recipient: ${toAgentId}`)
+    if (from.banned) throw new Error('Sender account is suspended')
+    if (from.spendableNano < amt) {
+      throw new Error(
+        `Insufficient spendable balance: have ${nanoToUsd(from.spendableNano)}, need ${nanoToUsd(amt)}`
+      )
+    }
+
+    const feeNano = feeBps > 0 ? (amt * BigInt(feeBps)) / 10_000n : 0n
+    const netNano = amt - feeNano
+
+    let referrerId = null
+    let referrerNano = 0n
+    if (feeNano > 0n && kind !== 'escrow_lock' && kind !== 'escrow_refund') {
+      const candidateRef = from.referredBy || to.referredBy || null
+      if (
+        candidateRef &&
+        candidateRef !== fromAgentId &&
+        candidateRef !== toAgentId &&
+        this.accounts.has(candidateRef) &&
+        !this.accounts.get(candidateRef).banned
+      ) {
+        referrerId = candidateRef
+        referrerNano = (feeNano * BigInt(this.referrerShareBps)) / 10_000n
+      }
+    }
+    const platformNano = feeNano - referrerNano
+
+    const receiptId = `rcpt_${randomBytes(6).toString('hex')}`
+    const event = {
+      type: 'TRANSFER',
+      ts: Date.now(),
+      receiptId,
+      fromAgentId,
+      toAgentId,
+      referrerId,
+      kind,
+      capability: capability || `commons:${kind}`,
+      memo: String(memo || '').slice(0, 200),
+      grossNano: amt.toString(),
+      netNano: netNano.toString(),
+      platformNano: platformNano.toString(),
+      referrerNano: referrerNano.toString(),
+      countAsVolume: Boolean(countAsVolume),
+    }
+
+    this._applyEvent(event)
+    this._appendWal(event)
+
+    return {
+      receiptId,
+      mode: kind,
+      grossNano: amt,
+      netNano,
+      platformNano,
+      referrerNano,
     }
   }
 
@@ -884,6 +967,51 @@ export class NanoLedger {
         })
         break
       }
+
+      case 'TRANSFER': {
+        const gross = BigInt(ev.grossNano)
+        const net = BigInt(ev.netNano)
+        const plat = BigInt(ev.platformNano)
+        const ref = BigInt(ev.referrerNano || '0')
+
+        const from = this.accounts.get(ev.fromAgentId)
+        const to = this.accounts.get(ev.toAgentId)
+        from.spendableNano -= gross
+        to.spendableNano += net
+
+        if (ev.referrerId && ref > 0n) {
+          const referrer = this.accounts.get(ev.referrerId)
+          if (referrer) {
+            referrer.spendableNano += ref
+            referrer.stats.referralEarnedNano += ref
+          } else {
+            this.treasuryNano += ref
+          }
+        }
+        this.treasuryNano += plat
+
+        if (
+          ev.kind !== 'escrow_refund' &&
+          ev.fromAgentId !== 'ag_bounty_escrow' &&
+          ev.fromAgentId !== 'ag_commons_pool'
+        ) {
+          from.stats.spentNano += gross
+        }
+        if (
+          ev.kind !== 'escrow_refund' &&
+          ev.toAgentId !== 'ag_bounty_escrow' &&
+          ev.toAgentId !== 'ag_commons_pool'
+        ) {
+          to.stats.earnedNano += net
+        }
+
+        if (ev.countAsVolume !== false) {
+          this.totalVolumeNano += gross
+          this.totalSettledCalls += 1
+          this._pushReceipt(ev)
+        }
+        break
+      }
     }
   }
 
@@ -953,19 +1081,22 @@ export class NanoLedger {
   }
 
   _pushReceipt(ev) {
+    const mode =
+      ev.type === 'SETTLE_P2P'
+        ? 'p2p'
+        : ev.type === 'SANDBOX_USE'
+          ? 'sandbox'
+          : ev.type === 'TRANSFER'
+            ? ev.kind || 'transfer'
+            : 'house'
     const entry = {
       receiptId: ev.receiptId,
       ts: ev.ts,
       utc: new Date(ev.ts).toISOString(),
-      mode:
-        ev.type === 'SETTLE_P2P'
-          ? 'p2p'
-          : ev.type === 'SANDBOX_USE'
-            ? 'sandbox'
-            : 'house',
+      mode,
       capability: ev.capability,
-      buyerId: ev.buyerId,
-      sellerId: ev.sellerId || 'house_upstream',
+      buyerId: ev.buyerId || ev.fromAgentId,
+      sellerId: ev.sellerId || ev.toAgentId || 'house_upstream',
       grossUsd: nanoToUsd(ev.grossNano || ev.buyerTotalNano || '0', 6),
       latencyMs: ev.latencyMs ?? 0,
     }

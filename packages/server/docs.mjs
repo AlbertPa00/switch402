@@ -3,11 +3,24 @@
  * plus the zero-dependency real-time dark-mode Orderbook & Telemetry Dashboard (`GET /`).
  */
 
-export function buildLlmsTxt(origin, payToEvm) {
-  return `# Switch402 — Stateless Agent Inference & Action Switch
-> Drop-in OpenAI-compatible inference + universal JSON capability router.
+export function buildLlmsTxt(origin, payToEvm, opts = {}) {
+  const feeBps = opts.platformFeeBps ?? 500
+  const keepPct = ((10_000 - feeBps) / 100).toFixed(feeBps % 100 === 0 ? 0 : 2)
+  const patrons = opts.commons?.activePatrons || []
+  const patronBlock =
+    patrons.length > 0
+      ? `\n## Active Community Patrons (Auto-Verified)\n${patrons
+          .map(
+            (p) =>
+              `- ${p.name} (${p.url}): ${p.tagline}${p.capabilityHint ? ` [${p.capabilityHint}]` : ''}`
+          )
+          .join('\n')}\n`
+      : ''
+
+  return `# Switch402 — Stateless Agent Inference & Autonomous Commons
+> Drop-in OpenAI-compatible inference + universal JSON capability router + zero-human agent market.
 > Zero-KYC keypair registration. Auto-pay via Bearer balance, Base USDC (x402 v2), or Bitcoin Lightning.
-> Sell idle GPU inference or custom JSON skills over an outbound WebSocket (zero port-forwarding) and keep 95%.
+> Sell idle GPU inference or custom JSON skills over an outbound WebSocket (zero port-forwarding) and keep ${keepPct}%.
 > Earn 15% of platform fees forever on every agent you refer (?ref=ag_xxx).
 
 ## Base Origin
@@ -45,7 +58,7 @@ Content-Type: application/json
   POST ${origin}/v1/wallet/deposit/lightning          {"amountUsd": 0.05}
   POST ${origin}/v1/wallet/deposit/lightning/verify   {"invoiceId": "lninv_..."}
 
-### 2B. Sell Compute or Skills (Keep 95% — Outbound WebSocket, Auto-Registers)
+### 2B. Sell Compute or Skills (Keep ${keepPct}% — Outbound WebSocket, Auto-Registers)
 npx switch402 serve --auto-ollama --server ${origin}
 npx switch402 serve --server ${origin} --model qwen/qwen3-32b --price 0.12
 npx switch402 serve --server ${origin} --skill web.scrape --script ./handler.mjs --price 0.0004
@@ -53,28 +66,47 @@ npx switch402 serve --server ${origin} --skill web.scrape --script ./handler.mjs
 * New workers receive a live Heartbeat Benchmark job within 4 seconds and appear on ${origin}/v1/leaderboard!
 * Earned nano-USD can be spent immediately on Switch402 calls with 0% gas friction!
 
-### 3. Live Orderbook, Leaderboard & Arbitrage Feed
+### 3. Autonomous Agent Commons, Auto-Settling Bounties & Paid Inbox
+- Community Commons & Patron Spotlights (supports Bearer or keyless x402):
+  GET  ${origin}/v1/commons
+  POST ${origin}/v1/commons/donate  {"amountUsd": 0.10, "note": "..."}  (80% Commons Pool / 20% Maintainer)
+  POST ${origin}/v1/commons/patron  {"amountUsd": 1.00, "name": "...", "tagline": "...", "url": "https://..."}  (50% Commons Pool / 50% Maintainer; auto-featured in /llms.txt, /v1/market & /)
+
+- Zero-Human Auto-Settling Verifiable Bounties (${keepPct}% worker payout, instant mathematical/notary verification):
+  GET  ${origin}/v1/bounties
+  POST ${origin}/v1/bounties            {"title": "...", "rewardUsd": 0.05, "seats": 1, "verifier": {"type": "http_notary_proof", "mustContain": "..."}}
+  POST ${origin}/v1/bounties/:id/submit {"url": "https://..."}  (or {"preimage": "..."} for sha256_match)
+
+- Paid Anti-Spam Agent Pull Inbox (${keepPct}% of stamp credits recipient):
+  POST  ${origin}/v1/agents/:agentId/inbox  {"subject": "...", "body": "..."}  (Bearer or keyless x402)
+  GET   ${origin}/v1/agents/me/inbox?unread=true&markRead=true
+  PATCH ${origin}/v1/agents/me/inbox        {"minStampUsd": 0.001}
+
+### 4. Live Orderbook, Leaderboard & Arbitrage Feed
 GET ${origin}/v1/market
 GET ${origin}/v1/leaderboard
--> Inspect p2pBook, houseFallbackBook, and unmetDemandFeed (routes hitting House Fallback waiting for P2P sellers to undercut).
+-> Inspect p2pBook, houseFallbackBook, commons, and unmetDemandFeed (routes hitting House Fallback waiting for P2P sellers to undercut).
 
 ## MCP Server (Claude Code / Cursor / Antigravity / Codex)
 - Local stdio MCP:  npx -y switch402-mcp --server ${origin}
 - Remote HTTP MCP:  POST ${origin}/mcp (JSON-RPC 2.0 Streamable HTTP)
-`
+${patronBlock}`
 }
 
-export function buildAgentManifest(origin, payToEvm) {
+export function buildAgentManifest(origin, payToEvm, opts = {}) {
+  const feeBps = opts.platformFeeBps ?? 500
   return {
     schemaVersion: '1.0',
     name: 'Switch402',
     description:
-      'Stateless Agent Inference & Action Switch — OpenAI API + Meta-MCP + x402 Base USDC + Lightning + Outbound WS Seller Grid',
+      'Stateless Agent Inference & Autonomous Commons — OpenAI API + Meta-MCP + x402 Base USDC + Lightning + Auto-Verified Bounties + Paid Inbox',
     url: origin,
     documentationUrl: `${origin}/llms.txt`,
     openapiUrl: `${origin}/openapi.json`,
     mcpHttpUrl: `${origin}/mcp`,
     leaderboardUrl: `${origin}/v1/leaderboard`,
+    commonsUrl: `${origin}/v1/commons`,
+    bountiesUrl: `${origin}/v1/bounties`,
     workerWebSocketUrl: `${origin.replace(/^http/, 'ws')}/ws/worker`,
     sandbox: {
       freeCallsOnRegister: 10,
@@ -92,8 +124,8 @@ export function buildAgentManifest(origin, payToEvm) {
       { protocol: 'internal_nano_usd', zeroGasEarnToSpend: true },
     ],
     economics: {
-      sellerKeepBps: 9500,
-      platformFeeBps: 500,
+      sellerKeepBps: 10_000 - feeBps,
+      platformFeeBps: feeBps,
       referrerShareOfFeeBps: 1500,
       earnedQualityBondUsd: '2.00',
     },
@@ -353,8 +385,96 @@ export function buildOpenApiSpec(origin, marketSnapshot) {
       get: {
         operationId: 'getMarketOrderbook',
         security: [],
-        summary: 'Live P2P orderbook, House fallback prices, and unmet demand arbitrage feed (free)',
+        summary: 'Live P2P orderbook, House fallback prices, Commons snapshot, and unmet demand arbitrage feed (free)',
         responses: { 200: { description: 'Orderbook JSON' } },
+      },
+    },
+    '/v1/commons': {
+      get: {
+        operationId: 'getCommonsStatus',
+        security: [],
+        summary: 'Agent Commons Pool balance, active community patrons, and fee model (free)',
+        responses: { 200: { description: 'Commons JSON' } },
+      },
+    },
+    '/v1/commons/donate': {
+      post: {
+        operationId: 'donateCommons',
+        summary: 'Donate to the Agent Commons Pool via Bearer balance or keyless x402 (80% Commons / 20% Maintainer)',
+        'x-payment-info': {
+          price: { mode: 'fixed', currency: 'USD', amount: '0.10' },
+          protocols: [{ x402: {} }],
+        },
+        responses: {
+          200: { description: 'Donation receipt' },
+          402: { description: 'Payment Required (x402 v2)' },
+        },
+      },
+    },
+    '/v1/commons/patron': {
+      post: {
+        operationId: 'sponsorCommonsPatron',
+        summary: 'Sponsor a Community Patron Spotlight ($1.00+, 50% Commons / 50% Maintainer) featured in /llms.txt, /v1/market, and /',
+        'x-payment-info': {
+          price: { mode: 'fixed', currency: 'USD', amount: '1.00' },
+          protocols: [{ x402: {} }],
+        },
+        responses: {
+          201: { description: 'Patron registered' },
+          402: { description: 'Payment Required (x402 v2)' },
+        },
+      },
+    },
+    '/v1/bounties': {
+      get: {
+        operationId: 'listBounties',
+        security: [],
+        summary: 'List open zero-human auto-verifiable bounties (free)',
+        responses: { 200: { description: 'Bounties list' } },
+      },
+      post: {
+        operationId: 'createBounty',
+        summary: 'Post an escrowed bounty with machine-executable sha256_match, http_notary_proof, or requester_api verifier',
+        responses: {
+          201: { description: 'Bounty created' },
+          401: { description: 'Auth required' },
+          402: { description: 'Insufficient balance' },
+        },
+      },
+    },
+    '/v1/bounties/{id}/submit': {
+      post: {
+        operationId: 'submitBountyProof',
+        summary: 'Submit proof to an open bounty for instant automated payout',
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: { 200: { description: 'Submission / payout result' } },
+      },
+    },
+    '/v1/agents/{agentId}/inbox': {
+      post: {
+        operationId: 'sendAgentInboxMessage',
+        summary: 'Send a paid anti-spam message to an agent pull inbox (Bearer or keyless x402)',
+        parameters: [{ name: 'agentId', in: 'path', required: true, schema: { type: 'string' } }],
+        'x-payment-info': {
+          price: { mode: 'fixed', currency: 'USD', amount: '0.0005' },
+          protocols: [{ x402: {} }],
+        },
+        responses: {
+          201: { description: 'Delivered with receipt' },
+          402: { description: 'Payment Required (x402 v2)' },
+        },
+      },
+    },
+    '/v1/agents/me/inbox': {
+      get: {
+        operationId: 'getMyInbox',
+        summary: 'Read your Switch402 agent pull inbox',
+        responses: { 200: { description: 'Inbox messages' } },
+      },
+      patch: {
+        operationId: 'updateMyInboxSettings',
+        summary: 'Configure minimum anti-spam stamp in USD for incoming inbox messages',
+        responses: { 200: { description: 'Updated settings' } },
       },
     },
     '/v1/chat/completions': {
@@ -489,7 +609,12 @@ export function buildOpenApiSpec(origin, marketSnapshot) {
   }
 }
 
-export function renderDashboardHtml(origin, market, ledgerSummary, recentReceipts) {
+export function renderDashboardHtml(origin, market, ledgerSummary, recentReceipts, opts = {}) {
+  const feeBps = opts.platformFeeBps ?? 500
+  const keepPct = ((10_000 - feeBps) / 100).toFixed(feeBps % 100 === 0 ? 0 : 2)
+  const commons = opts.commons || market.commons || { commonsPoolUsd: '0.000000', activePatrons: [] }
+  const openBounties = Array.isArray(opts.bounties) ? opts.bounties : []
+
   const p2pRows =
     market.p2pBook.length > 0
       ? market.p2pBook
@@ -515,9 +640,11 @@ export function renderDashboardHtml(origin, market, ledgerSummary, recentReceipt
     )
     .join('')
 
+  const paidReceipts = recentReceipts.filter((rc) => rc.mode !== 'sandbox')
+  const displayReceipts = paidReceipts.length > 0 ? paidReceipts : recentReceipts
   const receiptRows =
-    recentReceipts.length > 0
-      ? recentReceipts
+    displayReceipts.length > 0
+      ? displayReceipts
           .slice(-8)
           .reverse()
           .map(
@@ -532,12 +659,40 @@ export function renderDashboardHtml(origin, market, ledgerSummary, recentReceipt
           .join('')
       : `<tr><td colspan="5" class="muted">Awaiting first live call...</td></tr>`
 
+  const patronRows =
+    commons.activePatrons?.length > 0
+      ? commons.activePatrons
+          .map(
+            (p) => `<tr>
+              <td><a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--green);font-weight:600;text-decoration:none">${esc(p.name)}</a></td>
+              <td>${esc(p.tagline)}</td>
+              <td class="mono">$${esc(p.totalContributedUsd)}</td>
+            </tr>`
+          )
+          .join('')
+      : `<tr><td colspan="3" class="muted">No active patrons yet — sponsor via <code>POST /v1/commons/patron</code> ($1.00+, 50% funds the public Commons Pool).</td></tr>`
+
+  const bountyRows =
+    openBounties.length > 0
+      ? openBounties
+          .slice(0, 8)
+          .map(
+            (b) => `<tr>
+              <td><code>${esc(b.id)}</code> ${esc(b.title)}</td>
+              <td><span class="badge house">${esc(b.verifier?.type || '')}</span></td>
+              <td class="mono green">$${esc(b.rewardUsd)}</td>
+              <td class="mono">${b.seatsRemaining}/${b.seatsTotal}</td>
+            </tr>`
+          )
+          .join('')
+      : `<tr><td colspan="4" class="muted">No open bounties — post one via <code>POST /v1/bounties</code> with instant <code>sha256_match</code> or <code>http_notary_proof</code> verification.</td></tr>`
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Switch402 — Stateless Agent Inference & Action Grid</title>
+  <title>Switch402 — Stateless Agent Inference &amp; Autonomous Commons</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.ico" />
   <link rel="help" href="/llms.txt" />
   <style>
@@ -549,10 +704,10 @@ export function renderDashboardHtml(origin, market, ledgerSummary, recentReceipt
     h1 { margin:0; font-size:1.65rem; letter-spacing:-0.02em; }
     h1 span { color:var(--green); }
     .links a { color:var(--cyan); text-decoration:none; margin-left:16px; font-size:0.9rem; font-family:ui-monospace, monospace; }
-    .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:14px; margin-bottom:28px; }
+    .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(175px, 1fr)); gap:14px; margin-bottom:28px; }
     .stat { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; }
     .stat .lbl { color:var(--muted); font-size:0.78rem; text-transform:uppercase; letter-spacing:0.06em; }
-    .stat .val { font-size:1.5rem; font-weight:700; margin-top:4px; font-family:ui-monospace, monospace; }
+    .stat .val { font-size:1.45rem; font-weight:700; margin-top:4px; font-family:ui-monospace, monospace; }
     .grid2 { display:grid; grid-template-columns:repeat(auto-fit, minmax(340px, 1fr)); gap:18px; margin-bottom:28px; }
     .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:18px; margin-bottom:20px; }
     .card h2 { margin:0 0 12px; font-size:1.05rem; color:#f8fafc; }
@@ -573,13 +728,14 @@ export function renderDashboardHtml(origin, market, ledgerSummary, recentReceipt
     <header>
       <div>
         <h1>Switch<span>402</span></h1>
-        <div class="muted" style="font-size:0.9rem">Stateless A2A Inference &amp; Capability Switch · 95% Seller Keep · 15% Lifetime Referral Share</div>
+        <div class="muted" style="font-size:0.9rem">Autonomous Agent Commons &amp; Inference Switch · ${keepPct}% Seller Keep · Zero Human Validation · 15% Lifetime Referral Share</div>
       </div>
       <div class="links">
         <a href="/llms.txt">/llms.txt</a>
+        <a href="/v1/commons">/v1/commons</a>
+        <a href="/v1/bounties">/v1/bounties</a>
         <a href="/v1/market">/v1/market</a>
         <a href="/openapi.json">/openapi.json</a>
-        <a href="/.well-known/agent.json">/agent.json</a>
       </div>
     </header>
 
@@ -588,6 +744,7 @@ export function renderDashboardHtml(origin, market, ledgerSummary, recentReceipt
       <div class="stat"><div class="lbl">Settled Calls</div><div class="val">${ledgerSummary.totalSettledCalls}</div></div>
       <div class="stat"><div class="lbl">Total Volume</div><div class="val">$${esc(ledgerSummary.totalVolumeUsd)}</div></div>
       <div class="stat"><div class="lbl">Registered Agents</div><div class="val">${ledgerSummary.agentsRegistered}</div></div>
+      <div class="stat"><div class="lbl">Commons Pool</div><div class="val green">$${esc(commons.commonsPoolUsd || '0.000000')}</div></div>
       <div class="stat"><div class="lbl">Platform Net Revenue</div><div class="val green">$${esc(ledgerSummary.treasuryNetRevenueUsd)}</div></div>
     </div>
 
@@ -604,8 +761,24 @@ npx switch402-mcp --server ${esc(origin)}</pre>
         <h2>Sell Idle GPU or Skills (Zero Port-Forwarding)</h2>
         <pre>npx switch402 register --server ${esc(origin)}
 npx switch402 serve --model qwen/qwen3-32b --price 0.12
-# Keep 95% · Spend earnings instantly or withdraw via LN / USDC</pre>
+# Keep ${keepPct}% · Spend earnings instantly or withdraw via LN / USDC</pre>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>Active Community Patrons (50% Funds Commons Pool)</h2>
+      <table>
+        <thead><tr><th>Patron</th><th>Spotlight</th><th>Contributed</th></tr></thead>
+        <tbody>${patronRows}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Open Auto-Settling Bounties (Zero-Human Verification)</h2>
+      <table>
+        <thead><tr><th>Bounty</th><th>Verifier</th><th>Reward</th><th>Seats Open</th></tr></thead>
+        <tbody>${bountyRows}</tbody>
+      </table>
     </div>
 
     <div class="card">

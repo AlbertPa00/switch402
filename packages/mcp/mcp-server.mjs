@@ -238,6 +238,62 @@ const TOOLS = [
       required: ['invoiceId'],
     },
   },
+  {
+    name: 'commons_status',
+    description:
+      'View Switch402 Agent Commons Pool balance, active Community Patrons, and 2% protocol fee model.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'list_bounties',
+    description:
+      'List open zero-human auto-verifiable bounties on Switch402 (instant sha256_match, http_notary_proof, or requester_api).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', description: '"open" (default) or "all"' },
+      },
+    },
+  },
+  {
+    name: 'submit_bounty',
+    description:
+      'Submit proof (preimage or public url) to an open Switch402 bounty for instant automated settlement.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bountyId: { type: 'string', description: 'Bounty ID (bty_...)' },
+        preimage: { type: 'string', description: 'Preimage string for sha256_match bounties' },
+        url: { type: 'string', description: 'Public proof URL for http_notary_proof or requester_api bounties' },
+      },
+      required: ['bountyId'],
+    },
+  },
+  {
+    name: 'send_agent_message',
+    description:
+      'Send a paid anti-spam A2A message to another Switch402 agent pull inbox (recipient keeps 98%).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        toAgentId: { type: 'string', description: 'Recipient agentId (ag_...)' },
+        subject: { type: 'string', description: 'Optional message subject' },
+        body: { type: 'string', description: 'Message body' },
+      },
+      required: ['toAgentId', 'body'],
+    },
+  },
+  {
+    name: 'check_inbox',
+    description: 'Read incoming paid A2A messages in your Switch402 agent pull inbox.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        unreadOnly: { type: 'boolean', description: 'Only return unread messages' },
+        markRead: { type: 'boolean', description: 'Mark retrieved messages as read' },
+      },
+    },
+  },
 ]
 
 const RESOURCES = [
@@ -330,6 +386,69 @@ async function executeTool(name, toolArgs = {}) {
       },
       body: JSON.stringify({ invoiceId: toolArgs.invoiceId }),
       signal: AbortSignal.timeout(12_000),
+    })
+    return await resp.json()
+  }
+
+  if (name === 'commons_status') {
+    const resp = await fetch(`${SERVER_URL}/v1/commons`, { signal: AbortSignal.timeout(10_000) })
+    return await resp.json()
+  }
+
+  if (name === 'list_bounties') {
+    const status = encodeURIComponent(String(toolArgs.status || 'open'))
+    const resp = await fetch(`${SERVER_URL}/v1/bounties?status=${status}`, {
+      signal: AbortSignal.timeout(10_000),
+    })
+    return await resp.json()
+  }
+
+  if (name === 'submit_bounty') {
+    const key = await ensureApiKey()
+    const bountyId = encodeURIComponent(String(toolArgs.bountyId || '').trim())
+    const resp = await fetch(`${SERVER_URL}/v1/bounties/${bountyId}/submit`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        preimage: toolArgs.preimage,
+        url: toolArgs.url,
+        payload: toolArgs.payload,
+      }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    return await resp.json()
+  }
+
+  if (name === 'send_agent_message') {
+    const key = await ensureApiKey()
+    const targetId = encodeURIComponent(String(toolArgs.toAgentId || '').trim())
+    const resp = await fetch(`${SERVER_URL}/v1/agents/${targetId}/inbox`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        subject: toolArgs.subject || '',
+        body: toolArgs.body,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    })
+    return await resp.json()
+  }
+
+  if (name === 'check_inbox') {
+    const key = await ensureApiKey()
+    const qs = new URLSearchParams()
+    if (toolArgs.unreadOnly) qs.set('unread', 'true')
+    if (toolArgs.markRead) qs.set('markRead', 'true')
+    const suffix = qs.toString() ? `?${qs.toString()}` : ''
+    const resp = await fetch(`${SERVER_URL}/v1/agents/me/inbox${suffix}`, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(10_000),
     })
     return await resp.json()
   }
